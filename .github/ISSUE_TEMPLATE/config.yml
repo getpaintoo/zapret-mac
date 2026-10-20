@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Приложение Discord обрывается на 16 КБ
+    url: https://github.com/getpaintoo/zapret-mac/blob/main/docs/discord-16kb.md
+    about: Прочитай перед тем, как открывать issue про Discord — скорее всего, это ограничение провайдера.

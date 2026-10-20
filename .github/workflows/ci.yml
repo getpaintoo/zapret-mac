@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS — синтаксис и стратегии
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Синтаксис на системном bash 3.2
+        run: /bin/bash -n zapret-mac.sh
+
+      - name: Скачать tpws той версии, что зашита в скрипт
+        run: |
+          tag=$(sed -n 's/^ZAPRET_TAG="\(.*\)"$/\1/p' zapret-mac.sh)
+          sum=$(sed -n 's/^TPWS_SHA256="\(.*\)"$/\1/p' zapret-mac.sh)
+          curl -fsSL -o z.tgz "https://github.com/bol-van/zapret/releases/download/$tag/zapret-$tag.tar.gz"
+          tar -xzf z.tgz "zapret-$tag/binaries/mac64/tpws"
+          echo "$sum  zapret-$tag/binaries/mac64/tpws" | shasum -a 256 -c
+          echo "ZM_TPWS=$PWD/zapret-$tag/binaries/mac64/tpws" >> "$GITHUB_ENV"
+
+      - name: tpws принимает все стратегии
+        run: /bin/bash tests/dry-run.sh
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ошибки ShellCheck
+        run: shellcheck --severity=error zapret-mac.sh tests/dry-run.sh
