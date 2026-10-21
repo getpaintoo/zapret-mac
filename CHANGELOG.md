@@ -2,10 +2,24 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.3] — 2026-10-21
+
+### Добавлено
+- Подбор стратегий utunws под текущую сеть. Для Discord — SEQOVL, FAKE и FAKESEQOVL из Flowseal: на мобильном интернете МегаФона простой поддельный пакет (FAKE) не работает, а SEQOVL работает и там, и у домашнего провайдера. Стратегии проверяет временный utunws на `utun51`, рабочий Discord при этом не трогается.
+- YouTube через utunws (`hostfakesplit`) — если tpws на этой сети открывает YouTube не полностью. Подбор сам решает, через что пускать YouTube (`YT=tpws|utunws`).
+- Ручной выбор стратегии utunws и способа обхода YouTube в пункте 3.
+- Сторож при сбое подбирает заново и стратегии utunws.
+
+### Изменено
+- С utunws подбор tpws проверяет только YouTube: Discord через tpws не идёт, и его баллы только путали.
+- Сервер обновлений Discord (`stable.dl2.discordapp.net`) идёт через utunws вместе с остальным Discord.
+- Проверки считают открывшимся только то, что скачалось без ошибки; особые пометки для оборвавшихся соединений и уведомления о них убраны.
+- Замеры стратегий перенесены в `docs/architecture.md`, отдельный документ про Discord убран.
+
 ## [2.2] — 2026-10-21
 
 ### Добавлено
-- Второй движок для Discord — utunws из [Flowseal/zapret-mac-discord-youtube](https://github.com/Flowseal/zapret-mac-discord-youtube): nfqws, который получает пакеты через `utun` и отправляет через BPF. Стратегия `simple-fake`: поддельный ClientHello с `www.google.com` перед настоящим. Приложение Discord открывается целиком у провайдеров с обрывом Cloudflare на 16 КБ, голос по UDP идёт через обход.
+- Второй движок для Discord — utunws из [Flowseal/zapret-mac-discord-youtube](https://github.com/Flowseal/zapret-mac-discord-youtube): nfqws, который получает пакеты через `utun` и отправляет через BPF. Стратегия `simple-fake`: поддельный ClientHello с `www.google.com` перед настоящим. Приложение Discord, чаты и голос по UDP идут через обход без VPN.
 - LaunchDaemon `com.zapret-mac.utunws`, настройка «Discord через utunws» (пункт 9 → 5, `UTUNWS=1`).
 - «Проверить» при включённом VPN показывает и Discord через utunws.
 - utunws и поддельные пакеты скачиваются из релиза Flowseal, SHA-256 сверяется; `update` его переустанавливает при смене версии.
@@ -18,14 +32,14 @@
 ## [2.1] — 2026-10-21
 
 ### Добавлено
-- Проверки отличают обрыв на 16 КБ от блокировки: такой пункт показан как «оборвалось на N КБ» с объяснением. Подробности — [docs/discord-16kb.md](docs/discord-16kb.md).
+- Проверки отдельно помечали оборвавшиеся соединения (в 2.3 убрано).
 - Исключения для служб Apple (`list-exclude-mac.txt`).
 - Настройка «Автосписок» (пункт 9 → 4).
 - `tests/dry-run.sh` и CI: tpws должен принимать все стратегии.
 
 ### Изменено
-- Сторож не запускает подбор стратегий из-за обрыва на 16 КБ, а один раз присылает уведомление.
-- Автосписок tpws выключен по умолчанию: он принимал за блокировку обычные обрывы (например, `ocsp2.apple.com`), а у провайдеров с обрывом на 16 КБ ломает сайты на Cloudflare.
+- Сторож не запускал подбор из-за оборвавшихся соединений (в 2.3 убрано).
+- Автосписок tpws выключен по умолчанию: он принимал за блокировку обычные обрывы (например, `ocsp2.apple.com`) и начинал трогать сайты, которые и так работали.
 - Проверка «YouTube: видео» качает 49 байт (`report_mapping?di=no`) вместо ~750 КБ отладочной информации.
 
 ## 2.0 — 2026-10-21
@@ -46,5 +60,6 @@
 
 - tpws как SOCKS-прокси на `127.0.0.1:1080` с системным прокси macOS, одна стратегия на все сайты, LaunchAgent пользователя.
 
+[2.3]: https://github.com/getpaintoo/zapret-mac/releases/tag/v2.3
 [2.2]: https://github.com/getpaintoo/zapret-mac/releases/tag/v2.2
 [2.1]: https://github.com/getpaintoo/zapret-mac/releases/tag/v2.1

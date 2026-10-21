@@ -13,8 +13,8 @@
 #  Discord: второй движок — utunws из Flowseal/zapret-mac-discord-youtube
 #  (nfqws, который получает пакеты через utun и отправляет через BPF).
 #  pf уводит в него трафик к адресам Discord и голос по UDP. utunws шлёт
-#  поддельный ClientHello с именем www.google.com: так не срабатывает ни
-#  блокировка по имени discord.com, ни обрыв Cloudflare после 16 КБ.
+#  поддельный ClientHello с именем www.google.com, и провайдер пропускает
+#  соединение с Discord, приняв его за соединение с Google.
 #
 #  VPN: пока VPN в режиме TUN включён, сторож снимает перенаправление и весь
 #  трафик идёт через VPN. Выключили VPN — обход включается сам за доли
@@ -31,7 +31,7 @@
 #           (если якорь в /etc/pf.conf — sudo pfctl -a zapret-mac/zapret-mac -F all)
 # ════════════════════════════════════════════════════════════════════
 
-ZM_VERSION="2.2"
+ZM_VERSION="2.3"
 ZAPRET_TAG="v72.13"
 TPWS_SHA256="441524a76f52597a0e5c816d25ed1adfd93e5c34cc56c56e0dc00533929d1761"
 # utunws и поддельные пакеты для него — из релиза Flowseal/zapret-mac-discord-youtube
@@ -40,6 +40,7 @@ UTUNWS_URL="https://github.com/Flowseal/zapret-mac-discord-youtube/releases/down
 UTUNWS_SHA256="d8ecffeb91df7e5d76c3d926037d44959f29079add2fd12a16574f5ad2beb4a8"
 FAKE_TLS_SHA256="936c2bee4cfb80aa3c426b2dcbcc834b3fbcd1adb17172959dc569c73a14275c"   # tls_clienthello_www_google_com.bin
 FAKE_DS_SHA256="2fe18b3bd20807d36704d0b072092ee49ae84edca907a4420ab9a0f0f28fddcf"    # ACTIVE_DISCORD_UDP.bin
+FAKE_4PDA_SHA256="eefeaf09dde8d69b1f176212541f63c68b314a33a335eced99a8a29f17254da8"  # tls_clienthello_4pda_to.bin
 
 # всё лежит в папке root: её запускают системные демоны, править её может только админ
 DIR="/opt/zapret-mac"
@@ -66,6 +67,10 @@ UT_UNIT=51           # utunws открывает utun с этим номером
 UT_IF=utun50
 UT_LOCAL=10.77.0.1   # адреса точка-точка на utun50: pf шлёт туда пакеты через route-to
 UT_PEER=10.77.0.2
+UT_TEST_UNIT=52      # временный utunws для подбора — utun51, чтобы не трогать рабочий
+UT_TEST_IF=utun51
+UT_TEST_LOCAL=10.77.1.1
+UT_TEST_PEER=10.77.1.2
 CHECK_EVERY=1800     # как часто сторож проверяет YouTube и Discord, секунд
 CONTROL_URL="https://www.apple.com/library/test/success.html"
 UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -102,7 +107,8 @@ log()  { [ -d "$LOGS" ] && printf '%s %s\n' "$(date '+%d.%m %H:%M:%S')" "$*" >> 
 #   MODE=transparent|socks  S_Y, S_D — стратегии для YouTube и для Discord
 #   QUIC=1 — глушить QUIC к Google   AUTOFIX=1 — сторож сам подбирает стратегии
 #   PF_ROOT=com.apple|zapret-mac — куда подключаются наши правила pf
-#   UTUNWS=1 — Discord через utunws (поддельные пакеты); 0 — через tpws, как в 2.1
+#   UTUNWS=1 — Discord через utunws; 0 — через tpws, как в 2.1
+#   UT_D — стратегия utunws для Discord   YT=tpws|utunws — чем обходить YouTube
 cfg() { local v; v=$(sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n 1); printf '%s' "${v:-$2}"; }
 cfg_set() {
   touch "$CONF" && chmod 644 "$CONF" || return 1
@@ -199,27 +205,62 @@ build_main_args() {
   hl_set youtube; add_strategy "$(strat_of Y)"
   ARGS+=(--new); hl_set general; add_strategy "$(strat_of D)"
   # автосписок выключен по умолчанию: tpws путает с блокировкой обычные обрывы (ocsp.apple.com
-  # и т.п.), а у провайдеров с обрывом на 16 КБ обход ломает сайты на Cloudflare, которые и так работали
+  # и т.п.) и начинает трогать сайты, которые и так работали
   if [ "$(cfg AUTOLIST 0)" = 1 ]; then
     ARGS+=(--new); hl_set auto; add_auto_strategy "$(strat_of D)"
   fi
 }
 
-# utunws для Discord — стратегия simple-fake из Flowseal. Профили без списков доменов:
-# pf отдаёт utunws только адреса Discord и порты голоса. Пропускать через него что-то
-# без подделки нельзя: macOS отдаёт пакеты в utun не по порядку, utunws так их и
-# отправляет, провайдер не может прочитать имя сайта и режет соединение после 16 КБ.
-# результат — массив UT_ARGS
+# ─── стратегии utunws (из Flowseal) ─────────────────────────────────
+# Провайдеры по-разному относятся к поддельным пакетам: домашний пропускает Discord
+# с простым fake, а мобильный МегаФон fake игнорирует и пропускает только seqovl.
+# Поэтому стратегию для Discord подбирает подбор, как и для tpws. @F — папка
+# с поддельными пакетами (рядом с utunws).
+UT_STRAT_D=(
+"SEQOVL|--dpi-desync=multisplit --dpi-desync-split-seqovl=568 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_4pda_to.bin"
+"FAKE|--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fake-tls=@F/tls_clienthello_www_google_com.bin"
+"FAKESEQOVL|--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=10000000 --dpi-desync-repeats=8 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_www_google_com.bin --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com"
+)
+NUT=${#UT_STRAT_D[@]}
+# YouTube через utunws (YT=utunws) — на сетях, где tpws не справляется
+UT_YT="--ip-id=zero --dpi-desync=hostfakesplit --dpi-desync-fooling=ts --dpi-desync-hostfakesplit-mod=host=www.google.com"
+
+ut_strat_name() { local s=${UT_STRAT_D[$(( $1 - 1 ))]}; printf '%s' "${s%%|*}"; }
+ut_of() {   # стратегия utunws для Discord из настроек
+  local n
+  n=$(cfg UT_D 1)
+  case $n in ''|*[!0-9]*) n=1 ;; esac
+  { [ "$n" -ge 1 ] && [ "$n" -le "$NUT" ]; } || n=1
+  printf '%s' "$n"
+}
+yt_engine() { if [ "$(cfg YT tpws)" = utunws ]; then printf utunws; else printf tpws; fi; }
+
+# дописывает в UT_ARGS строку параметров $1, подставляя папку с поддельными пакетами
+add_ut_tokens() {
+  local tok
+  set -f
+  for tok in $1; do UT_ARGS+=("${tok//@F/${UTUNWS%/*}}"); done
+  set +f
+}
+
+# параметры utunws: $1 — стратегия для Discord, $2 = 1 — ещё и YouTube. Результат — UT_ARGS.
+# Каждый профиль привязан к адресам (--ipset-ip): pf отдаёт utunws только Discord, голос
+# и, если YT=utunws, Google. Пропускать что-то без обработки нельзя: macOS отдаёт пакеты
+# в utun не по порядку, utunws так их и отправляет, и провайдер, не прочитав имя сайта,
+# может оборвать соединение.
 build_ut_args() {
-  local d=${UTUNWS%/*}
-  UT_ARGS=("--filter-tcp=443,2053,2083,2087,2096,8443"
-           --dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts
-           "--dpi-desync-fake-tls=$d/tls_clienthello_www_google_com.bin"
-           --new
-           "--filter-udp=19294-19344,50000-50100" "--filter-l7=discord,stun"
-           --dpi-desync=fake --dpi-desync-repeats=6
-           "--dpi-desync-fake-discord=$d/ACTIVE_DISCORD_UDP.bin" "--dpi-desync-fake-stun=$d/ACTIVE_DISCORD_UDP.bin"
-           --user=nobody)
+  local d=${UTUNWS%/*} s
+  s=${UT_STRAT_D[$(( $1 - 1 ))]}
+  UT_ARGS=("--filter-tcp=443,2053,2083,2087,2096,8443" "--ipset-ip=${DS4//, /,}")
+  add_ut_tokens "${s#*|}"
+  if [ "$2" = 1 ]; then
+    UT_ARGS+=(--new --filter-tcp=443 "--ipset-ip=${GOOGLE4//, /,}")
+    add_ut_tokens "$UT_YT"
+  fi
+  UT_ARGS+=(--new "--filter-udp=19294-19344,50000-50100" "--filter-l7=discord,stun"
+            --dpi-desync=fake --dpi-desync-repeats=6
+            "--dpi-desync-fake-discord=$d/ACTIVE_DISCORD_UDP.bin" "--dpi-desync-fake-stun=$d/ACTIVE_DISCORD_UDP.bin"
+            --user=nobody)
 }
 
 # временный SOCKS-tpws для подбора; $1 = номер стратегии или cur (текущие), $2 = адрес для исходящих
@@ -235,15 +276,13 @@ build_test_args() {
 }
 
 # ─── что проверяем ───────────────────────────────────────────────────
-# группа|название|адрес. Группа Y — домены из list-youtube (туда же Flowseal
-# отнёс сервер загрузок Discord), D — из list-general.
-# Главная discord.com весит ~24 КБ — на ней видно, режет ли провайдер Cloudflare после 16 КБ
+# группа|название|адрес. Y — YouTube, D — Discord.
 TARGETS=(
 "D|Discord|https://discord.com/"
 "D|Discord: шлюз|https://gateway.discord.gg/"
 "D|Discord: CDN|https://cdn.discordapp.com/"
 "D|Discord: проверка обновлений|https://updates.discord.com/distributions/app/manifests/latest?channel=stable&platform=osx&arch=arm64"
-"Y|Discord: скачивание обновлений|https://stable.dl2.discordapp.net/"
+"D|Discord: скачивание обновлений|https://stable.dl2.discordapp.net/"
 "Y|YouTube|https://www.youtube.com/"
 "Y|YouTube: картинки|https://i.ytimg.com/"
 "Y|YouTube: видео|https://redirector.googlevideo.com/report_mapping?di=no"
@@ -268,13 +307,9 @@ probe_user() {
 #        apps       — как обычная программа: от имени пользователя, без прокси
 #        utun       — от имени пользователя через физический интерфейс: при включённом
 #                     VPN так видно utunws (правила для этого грузит ut_test_on)
-# результат: LAST_RC[i] (ok|cut|fail|skip), LAST_KB[i], SCORE_Y из NY, SCORE_D из ND, LAST_FAIL, LAST_CUT
-#
-# cut — TLS прошёл, ответ пошёл и замер на первых килобайтах. Так провайдер режет
-# соединения с Cloudflare, в которых не смог прочитать имя сайта (а tpws его прячет).
-# Стратегия своё дело сделала, другая тут не поможет — поэтому в баллы cut идёт как успех.
+# результат: LAST_RC[i] (ok|fail|skip), SCORE_Y из NY, SCORE_D из ND, LAST_FAIL
 run_checks() {
-  local how=$1 tmp i t url pu="" pids=() rc size tls
+  local how=$1 tmp i t url pu="" pids=() rc
   local -a px comp pre
   tmp=$(mktemp -d /tmp/zapret-mac-chk.XXXXXX) || return 1
   case $how in
@@ -292,36 +327,29 @@ run_checks() {
     pre=(env -u ALL_PROXY -u all_proxy -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy)
     [ -n "$pu" ] && pre=(sudo -u "$pu")
     (
-      out=$("${pre[@]}" /usr/bin/curl -s "${comp[@]}" -o /dev/null --connect-timeout 5 --max-time 8 -A "$UA" "${px[@]}" \
-            -w '%{size_download} %{time_appconnect}' "$url")
-      echo "$? $out" > "$tmp/$i"
+      "${pre[@]}" /usr/bin/curl -s "${comp[@]}" -o /dev/null --connect-timeout 5 --max-time 8 -A "$UA" "${px[@]}" "$url"
+      echo "$?" > "$tmp/$i"
     ) &
     pids+=($!)
   done
   wait "${pids[@]}" 2>/dev/null
-  SCORE_Y=0; SCORE_D=0; NY=0; ND=0; LAST_FAIL=""; LAST_CUT=""; LAST_RC=(); LAST_KB=()
+  SCORE_Y=0; SCORE_D=0; NY=0; ND=0; LAST_FAIL=""; LAST_RC=()
   for (( i=0; i<NT; i++ )); do
     t=${TARGETS[$i]}
-    if [ -n "$CHECK_ONLY" ] && [ "${t%%|*}" != "$CHECK_ONLY" ]; then LAST_RC[$i]=skip; LAST_KB[$i]=0; continue; fi
-    rc=""; size=0; tls=0
-    read -r rc size tls 2>/dev/null < "$tmp/$i"
-    case $size in ''|*[!0-9]*) size=0 ;; esac
-    LAST_KB[$i]=$(( size / 1024 ))
-    LAST_RC[$i]=fail
+    # NY и ND — размер группы целиком, даже если проверяли только другую
+    if [ "${t%%|*}" = Y ]; then NY=$(( NY + 1 )); else ND=$(( ND + 1 )); fi
+    if [ -n "$CHECK_ONLY" ] && [ "${t%%|*}" != "$CHECK_ONLY" ]; then LAST_RC[$i]=skip; continue; fi
+    rc=""
+    read -r rc 2>/dev/null < "$tmp/$i"
     if [ "$rc" = 0 ]; then
       LAST_RC[$i]=ok
-    elif [ "$rc" = 28 ] && [ "$size" -gt 0 ] && [ "$size" -le 32768 ] && [ -n "${tls//[0.,]/}" ]; then
-      LAST_RC[$i]="cut"   # время TLS-рукопожатия не нулевое — значит, рукопожатие было
+      if [ "${t%%|*}" = Y ]; then SCORE_Y=$(( SCORE_Y + 1 )); else SCORE_D=$(( SCORE_D + 1 )); fi
+    else
+      LAST_RC[$i]=fail
+      LAST_FAIL="$LAST_FAIL, $(t_label "$t")"
     fi
-    if [ "${t%%|*}" = Y ]; then NY=$(( NY + 1 )); else ND=$(( ND + 1 )); fi
-    case ${LAST_RC[$i]} in
-      fail) LAST_FAIL="$LAST_FAIL, $(t_label "$t")" ;;
-      *)    if [ "${t%%|*}" = Y ]; then SCORE_Y=$(( SCORE_Y + 1 )); else SCORE_D=$(( SCORE_D + 1 )); fi ;;
-    esac
-    [ "${LAST_RC[$i]}" = cut ] && LAST_CUT="$LAST_CUT, $(t_label "$t")"
   done
   LAST_FAIL=${LAST_FAIL#, }
-  LAST_CUT=${LAST_CUT#, }
   rm -rf "$tmp"
 }
 
@@ -331,29 +359,9 @@ print_checks() {
     case ${LAST_RC[$i]} in
       skip) ;;
       ok)  printf '   %s✓%s %s\n' "$G" "$N" "$(t_label "${TARGETS[$i]}")" ;;
-      cut) printf '   %s!%s %s %s— оборвалось на %s КБ%s\n' "$Y" "$N" "$(t_label "${TARGETS[$i]}")" "$D" "${LAST_KB[$i]}" "$N" ;;
       *)   printf '   %s✗%s %s\n' "$R" "$N" "$(t_label "${TARGETS[$i]}")" ;;
     esac
   done
-}
-
-# объяснение для обрыва на 16 КБ; $1 — список того, что оборвалось,
-# $2 = tpws — проверяли через tpws, apps — так, как идут программы (с utunws, если он работает)
-cut_note() {
-  [ -n "$1" ] || return 0
-  warn "Обрыв после ~16 КБ: $1."
-  if [ "$2" = tpws ] && ut_wanted; then
-    say  "   ${D}Это проверка через tpws, а Discord у тебя идёт через utunws — ему обрыв не страшен."
-    say  "   Как Discord открывается через utunws, показывает пункт 5 «Проверить».${N}"
-  elif ut_active; then
-    say  "   utunws работает, но обрыв остался: похоже, провайдер не верит поддельным пакетам."
-    say  "   Пришли в Issues хвост лога $LOGS/utunws.log. На это время Discord — через VPN."
-  else
-    say  "   Это ограничение провайдера, а не стратегии: соединения с Cloudflare, в которых он"
-    say  "   не может прочитать имя сайта, режутся после 16 КБ. А прятать имя — и есть работа tpws."
-    say  "   Обходит это utunws поддельными пакетами (пункт 9 → 5). Без него Discord на этом"
-    say  "   провайдере работает только через VPN."
-  fi
 }
 
 score_mark() {
@@ -485,10 +493,11 @@ SKIP6="::/127, fc00::/7, fe80::/10, ff00::/8"
 # сервисы Google без Google Cloud (там бывают VPN-серверы, их QUIC трогать нельзя)
 GOOGLE4="8.8.4.0/24, 8.8.8.0/24, 64.233.160.0/19, 66.102.0.0/20, 66.249.64.0/19, 72.14.192.0/18, 74.125.0.0/16, 108.170.192.0/18, 108.177.0.0/17, 142.250.0.0/15, 172.217.0.0/16, 172.253.0.0/16, 173.194.0.0/16, 192.178.0.0/15, 209.85.128.0/17, 216.58.192.0/19, 216.239.32.0/19"
 GOOGLE6="2001:4860::/32, 2404:6800::/32, 2607:f8b0::/32, 2800:3f0::/32, 2a00:1450::/32, 2c0f:fb50::/32"
-# адреса Discord на Cloudflare: discord.com, gateway.discord.gg, cdn.discordapp.com,
-# media.discordapp.net, discord.media — все в 162.159.128.0–162.159.139.255.
-# По IPv6 есть только discord.media; его не пускаем, чтобы Discord шёл по IPv4 через utunws
-DS4="162.159.128.0/21, 162.159.136.0/22"
+# адреса Discord: discord.com, gateway.discord.gg, cdn.discordapp.com, media.discordapp.net,
+# discord.media — на Cloudflare, 162.159.128.0–162.159.139.255; обновления
+# (stable.dl2.discordapp.net) — в Google Cloud. По IPv6 есть только discord.media;
+# его не пускаем, чтобы Discord шёл по IPv4 через utunws
+DS4="162.159.128.0/21, 162.159.136.0/22, 34.126.226.51/32"
 DS6="2606:4700:7::a29f:8000/116"
 DS_TCP="443, 2053, 2083, 2087, 2096, 8443"
 DS_UDP="19294:19344, 50000:50100"   # голос Discord
@@ -506,6 +515,10 @@ ut_rules() {
   if [ "$1" = tables ]; then
     printf 'table <zm_ds4> const { %s }\n' "$DS4"
     printf 'table <zm_ds6> const { %s }\n' "$DS6"
+    if [ "$(yt_engine)" = utunws ]; then
+      printf 'table <zm_g4> const { %s }\n' "$GOOGLE4"
+      printf 'table <zm_g6> const { %s }\n' "$GOOGLE6"
+    fi
     return 0
   fi
   # пакет, отправленный в utun50, pf проверяет ещё раз — уже там. Без этого правила
@@ -518,6 +531,12 @@ ut_rules() {
   # QUIC к Discord — сразу отказ, приложение уходит на TCP, то есть в utunws
   printf 'block return out quick on %s inet proto udp from any to <zm_ds4> port 443 user { >root }\n' "$PHYS"
   printf 'block return out quick on %s inet6 proto { tcp, udp } from any to <zm_ds6> user { >root }\n' "$PHYS"
+  [ "$(yt_engine)" = utunws ] || return 0
+  # YouTube через utunws: TCP к Google — туда же, QUIC и IPv6 к Google — отказ
+  printf 'pass out quick on %s route-to (%s %s) inet proto tcp from any to <zm_g4> port 443 user { >root } no state\n' \
+    "$PHYS" "$UT_IF" "$UT_PEER"
+  printf 'block return out quick on %s inet proto udp from any to <zm_g4> port 443 user { >root }\n' "$PHYS"
+  printf 'block return out quick on %s inet6 proto { tcp, udp } from any to <zm_g6> port 443 user { >root }\n' "$PHYS"
 }
 
 # Правила из docs/bsd.md оригинала: исходящий TCP 80/443 уводится на lo0 (route-to),
@@ -656,7 +675,8 @@ test_env_up() {
 }
 
 test_rules() {   # $1 = ut — ещё и правила utunws: соединения с адреса Wi-Fi к Discord идут в него
-  printf 'pass out quick on %s route-to (%s %s) inet proto tcp from %s to any\n' "$TEST_VPN" "$PHYS" "$PHYS_GW" "$PHYS_IP"
+  [ -n "$TEST_VPN" ] &&
+    printf 'pass out quick on %s route-to (%s %s) inet proto tcp from %s to any\n' "$TEST_VPN" "$PHYS" "$PHYS_GW" "$PHYS_IP"
   [ "$1" = ut ] || return 0
   printf 'table <zm_skip4> const { %s }\n' "$SKIP4"
   ut_rules tables
@@ -666,6 +686,53 @@ test_rules() {   # $1 = ut — ещё и правила utunws: соединен
 # отдают его соединения с Discord в utunws. Обычный трафик программ идёт в VPN и их не задевает
 ut_test_on() { [ -n "$TEST_VPN" ] && ut_active && test_rules ut | pf_load "$(anchor_test)"; }
 ut_test_off() { [ -n "$TEST_VPN" ] && test_rules | pf_load "$(anchor_test)"; }
+
+# Подбор для utunws: временный utunws на utun51 со стратегией $1 для Discord и, если $2 = 1,
+# для YouTube. Проверочные запросы идут от root через физический интерфейс (run_checks direct):
+# правила основного якоря трафик root не трогают, а эти отдают его временному utunws.
+# Рабочий utunws на utun50 и Discord пользователя при этом не трогаются
+ut_try_rules() {
+  test_rules
+  printf 'table <zm_t4> const { %s }\n' "$DS4"
+  printf 'pass out quick on %s all no state\n' "$UT_TEST_IF"
+  printf 'pass out quick on %s route-to (%s %s) inet proto tcp from any to <zm_t4> port { %s } user root no state\n' \
+    "$PHYS" "$UT_TEST_IF" "$UT_TEST_PEER" "$DS_TCP"
+  printf 'block return out quick on %s inet proto udp from any to <zm_t4> port 443 user root\n' "$PHYS"
+  [ "$1" = 1 ] || return 0
+  printf 'table <zm_tg4> const { %s }\n' "$GOOGLE4"
+  printf 'pass out quick on %s route-to (%s %s) inet proto tcp from any to <zm_tg4> port 443 user root no state\n' \
+    "$PHYS" "$UT_TEST_IF" "$UT_TEST_PEER"
+  printf 'block return out quick on %s inet proto udp from any to <zm_tg4> port 443 user root\n' "$PHYS"
+}
+
+ut_try_start() {
+  local mac i
+  UT_TPID=""
+  ifconfig "$UT_TEST_IF" >/dev/null 2>&1 && return 1
+  mac=$(gw_mac "$PHYS_GW") || return 1
+  build_ut_args "$1" "$2"
+  ZAPRET_IFACE=$PHYS ZAPRET_GATEWAY_MAC=$mac ZAPRET_UTUN_UNIT=$UT_TEST_UNIT "$UTUNWS" "${UT_ARGS[@]}" >/dev/null 2>&1 &
+  UT_TPID=$!
+  for (( i=0; i<50; i++ )); do ifconfig "$UT_TEST_IF" >/dev/null 2>&1 && break; sleep 0.1; done
+  if ! ifconfig "$UT_TEST_IF" "$UT_TEST_LOCAL" "$UT_TEST_PEER" netmask 255.255.255.255 up >/dev/null 2>&1 ||
+     ! ut_try_rules "$2" | pf_load "$(anchor_test)" || ! pf_take "$RUN/pf-token-test"; then
+    ut_try_stop
+    return 1
+  fi
+}
+
+ut_try_stop() {
+  local i
+  [ -n "$UT_TPID" ] && { kill "$UT_TPID" 2>/dev/null; wait "$UT_TPID" 2>/dev/null; }
+  UT_TPID=""
+  for (( i=0; i<30; i++ )); do ifconfig "$UT_TEST_IF" >/dev/null 2>&1 || break; sleep 0.1; done
+  if [ -n "$TEST_VPN" ]; then
+    test_rules | pf_load "$(anchor_test)"
+  else
+    pfctl -q -a "$(anchor_test)" -F all >/dev/null 2>&1
+    pf_give "$RUN/pf-token-test"
+  fi
+}
 
 test_env_down() {
   [ -n "$TEST_VPN" ] || return 0
@@ -798,8 +865,8 @@ ut_run() {
   mkdir -p "$LOGS" "$RUN"
   trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -f "$RUN/utunws.net"; exit 0' TERM INT
   until detect_phys && mac=$(gw_mac "$PHYS_GW"); do sleep 5; done
-  build_ut_args
-  say "$(date '+%d.%m %H:%M:%S') запускаю utunws: $PHYS, шлюз $PHYS_GW ($mac)"
+  build_ut_args "$(ut_of)" "$([ "$(yt_engine)" = utunws ] && echo 1)"
+  say "$(date '+%d.%m %H:%M:%S') запускаю utunws: $PHYS, шлюз $PHYS_GW ($mac), Discord — $(ut_strat_name "$(ut_of)"), YouTube — $(yt_engine)"
   t0=$SECONDS
   ZAPRET_IFACE=$PHYS ZAPRET_GATEWAY_MAC=$mac ZAPRET_UTUN_UNIT=$UT_UNIT "$UTUNWS" "${UT_ARGS[@]}" &
   pid=$!
@@ -855,7 +922,8 @@ ut_apply() {
 # ставит utunws, если он нужен и его ещё нет; неудача не мешает остальному обходу
 ut_ensure() {
   [ "$(cfg UTUNWS 1)" = 1 ] || return 0
-  [ -x "$UTUNWS" ] && [ "$(cat "$DIR/utunws-version" 2>/dev/null)" = "$UTUNWS_TAG" ] && return 0
+  [ -x "$UTUNWS" ] && [ -f "${UTUNWS%/*}/tls_clienthello_4pda_to.bin" ] &&
+    [ "$(cat "$DIR/utunws-version" 2>/dev/null)" = "$UTUNWS_TAG" ] && return 0
   install_utunws || warn "Discord пойдёт через tpws, как раньше. Повторить установку — пункт 13 «Обновить»."
 }
 
@@ -1026,17 +1094,20 @@ install_utunws() {
   if ! curl -fL --progress-bar --connect-timeout 15 -o "$tmp/z.zip" "$UTUNWS_URL"; then
     rm -rf "$tmp"; err "Не удалось скачать $UTUNWS_URL"; return 1
   fi
-  if ! unzip -q -o "$tmp/z.zip" "$p/utunws" "$p/tls_clienthello_www_google_com.bin" "$p/ACTIVE_DISCORD_UDP.bin" -d "$tmp" 2>/dev/null; then
+  if ! unzip -q -o "$tmp/z.zip" "$p/utunws" "$p/tls_clienthello_www_google_com.bin" "$p/ACTIVE_DISCORD_UDP.bin" \
+         "$p/tls_clienthello_4pda_to.bin" -d "$tmp" 2>/dev/null; then
     rm -rf "$tmp"; err "В архиве Flowseal нет utunws."; return 1
   fi
-  for f in utunws:$UTUNWS_SHA256 tls_clienthello_www_google_com.bin:$FAKE_TLS_SHA256 ACTIVE_DISCORD_UDP.bin:$FAKE_DS_SHA256; do
+  for f in utunws:$UTUNWS_SHA256 tls_clienthello_www_google_com.bin:$FAKE_TLS_SHA256 ACTIVE_DISCORD_UDP.bin:$FAKE_DS_SHA256 \
+           tls_clienthello_4pda_to.bin:$FAKE_4PDA_SHA256; do
     want=${f#*:}; f=${f%%:*}
     got=$(shasum -a 256 "$tmp/$p/$f" | awk '{print $1}')
     if [ "$got" != "$want" ]; then
       rm -rf "$tmp"; err "Контрольная сумма $f не совпала — файл повреждён или подменён. utunws не установлен."; return 1
     fi
   done
-  install -m 644 -o root -g wheel "$tmp/$p/tls_clienthello_www_google_com.bin" "$tmp/$p/ACTIVE_DISCORD_UDP.bin" "$BIN_DIR/" &&
+  install -m 644 -o root -g wheel "$tmp/$p/tls_clienthello_www_google_com.bin" "$tmp/$p/ACTIVE_DISCORD_UDP.bin" \
+    "$tmp/$p/tls_clienthello_4pda_to.bin" "$BIN_DIR/" &&
     install -m 755 -o root -g wheel "$tmp/$p/utunws" "$UTUNWS.new" && mv -f "$UTUNWS.new" "$UTUNWS"
   xattr -c "$UTUNWS" 2>/dev/null
   rm -rf "$tmp"
@@ -1142,11 +1213,9 @@ cmd_start() {
   fi
   [ "$mode" = socks ] && { proxy_on || return 1; }
   wd_load || warn "Сторож не запустился — автопереключение с VPN работать не будет."
-  log "Включён: режим $(mode_name), YouTube — $(strat_of Y), Discord — $(strat_of D)$(ut_active && printf ', utunws')"
-  say "   Стратегии: YouTube — $(strat_of Y) ($(strat_name "$(strat_of Y)")), Discord — $(strat_of D) ($(strat_name "$(strat_of D)"))"
-  if ut_active; then
-    ok "Discord — через utunws: поддельные пакеты обходят обрыв на 16 КБ, звонки тоже идут через обход"
-  fi
+  log "Включён: режим $(mode_name), YouTube — $(yt_desc), Discord — $(ds_desc)"
+  say "   YouTube — $(yt_desc), Discord — $(ds_desc)"
+  ut_active && ok "Discord и звонки идут через utunws"
   say "   Работает в фоне и сам включается после перезагрузки, пока не выберешь «Выключить»."
   say "   VPN можно включать и выключать как обычно — сторож переключает обход сам."
   warn_other_proxies
@@ -1167,63 +1236,138 @@ cmd_stop() {
   ok "Обход выключен, перенаправление и прокси сняты."
 }
 
-# подбор стратегий. $1 = all — прогнать все; auto — для сторожа: сначала проверить текущие
-# результат: SEL_Y, SEL_D (номера), SEL_SY, SEL_SD (баллы), SEL_PATH=1 если текущие и так рабочие,
-# SEL_CUT — что обрывалось на 16 КБ
+# можно ли подбирать стратегии utunws: он включён, установлен целиком и работает прозрачный режим
+ut_selectable() { ut_wanted && [ -f "${UTUNWS%/*}/tls_clienthello_4pda_to.bin" ]; }
+
+# одна строка подбора: $1 — номер, $2 — из скольких, $3 — название, дальше — что показать (Y, D)
+sel_line() {
+  local i=$1 n=$2 name=$3 g
+  shift 3
+  printf ' [%2d/%d] %-10s' "$i" "$n" "$name"
+  for g in "$@"; do
+    if [ "$g" = Y ]; then printf ' YouTube %s' "$(score_mark "$SCORE_Y" "$NY")"
+    else printf ' Discord %s' "$(score_mark "$SCORE_D" "$ND")"; fi
+  done
+  [ -n "$LAST_FAIL" ] && printf '  %sне открылось: %s%s' "$D" "$LAST_FAIL" "$N"
+  printf '\n'
+}
+
+# Подбор стратегий. $1 = all — прогнать все; auto — для сторожа: сначала проверить текущие.
+# С utunws Discord подбирается среди стратегий utunws, YouTube — среди стратегий tpws, а если
+# tpws открывает не всё, ещё и через utunws. Без utunws обе группы подбираются через tpws.
+# Результат: SEL_Y, SEL_STY — лучшая стратегия tpws для YouTube и её балл; SEL_YT — tpws|utunws;
+# SEL_SY — балл YouTube выбранным способом; SEL_D, SEL_SD — Discord (номер utunws, если SEL_UT=1,
+# иначе tpws) и балл; SEL_PATH=1 — текущие и так рабочие
 select_strategies() {
-  local i by bd sy=-1 sd=-1 bind=""
-  SEL_PATH=0; SEL_CUT=""
+  local i by bd ud yt sy=-1 sd=-1 tsy=-1 bind="" ut=0 only=""
+  SEL_PATH=0
   test_env_up || return 1
-  trap 'stop_test; test_env_down; exit 130' INT TERM HUP
+  trap 'stop_test; ut_try_stop; test_env_down; exit 130' INT TERM HUP
   [ -n "$TEST_VPN" ] && bind=$PHYS_IP
-  by=$(strat_of Y); bd=$(strat_of D)
+  ut_selectable && { ut=1; only=Y; }
+  by=$(strat_of Y); bd=$(strat_of D); ud=$(ut_of); yt=tpws
+  [ "$ut" = 1 ] && yt=$(yt_engine)
   say ""
   say "${B}Без обхода${N} ${D}(напрямую через $PHYS)${N}"
-  run_checks direct
+  CHECK_ONLY=""; run_checks direct
   print_checks
   if [ "$SCORE_Y" -eq "$NY" ] && [ "$SCORE_D" -eq "$ND" ]; then
     warn "Всё открывается и без обхода — блокировок сейчас нет. Подбор всё равно проведу."
   fi
-  if [ "$1" = auto ] && start_test cur "$bind"; then
-    run_checks "socks:$TEST_PORT"; stop_test
-    sy=$SCORE_Y; sd=$SCORE_D; SEL_CUT=$LAST_CUT
+  if [ "$1" = auto ]; then
+    # текущие стратегии: если всё открывается, сломался не обход, а перенаправление
+    if [ "$ut" = 1 ]; then
+      if ut_try_start "$ud" "$([ "$yt" = utunws ] && echo 1)"; then
+        CHECK_ONLY=D; [ "$yt" = utunws ] && CHECK_ONLY=""
+        run_checks direct; ut_try_stop
+        sd=$SCORE_D; [ "$yt" = utunws ] && { sy=$SCORE_Y; tsy=0; }
+      fi
+    fi
+    if [ "$yt" = tpws ] && start_test cur "$bind"; then
+      CHECK_ONLY=$only; run_checks "socks:$TEST_PORT"; stop_test
+      sy=$SCORE_Y; tsy=$sy; [ "$ut" = 1 ] || sd=$SCORE_D
+    fi
+    CHECK_ONLY=""
     say "Текущие стратегии: YouTube $(score_mark "$sy" "$NY") · Discord $(score_mark "$sd" "$ND")"
     if [ "$sy" -eq "$NY" ] && [ "$sd" -eq "$ND" ]; then
-      SEL_PATH=1; SEL_Y=$by; SEL_D=$bd; SEL_SY=$sy; SEL_SD=$sd
+      SEL_PATH=1; SEL_Y=$by; SEL_STY=$tsy; SEL_YT=$yt; SEL_SY=$sy; SEL_UT=$ut; SEL_SD=$sd
+      if [ "$ut" = 1 ]; then SEL_D=$ud; else SEL_D=$bd; fi
       test_env_down; trap - INT TERM HUP
       return 0
     fi
+    sy=-1; sd=-1; tsy=-1
   fi
+
   say ""
-  say "${B}Перебираю стратегии${N} ${D}(до 10 секунд на каждую)${N}"
+  if [ "$ut" = 1 ]; then say "${B}YouTube через tpws${N} ${D}(до 10 секунд на стратегию)${N}"
+  else say "${B}YouTube и Discord через tpws${N} ${D}(до 10 секунд на стратегию)${N}"; fi
   for (( i=1; i<=NSTRAT; i++ )); do
     if ! start_test "$i" "$bind"; then
-      printf ' [%2d/%d] %-7s не запустилась\n' "$i" "$NSTRAT" "$(strat_name "$i")"
+      printf ' [%2d/%d] %-10s не запустилась\n' "$i" "$NSTRAT" "$(strat_name "$i")"
       continue
     fi
-    run_checks "socks:$TEST_PORT"; stop_test
-    printf ' [%2d/%d] %-7s YouTube %s  Discord %s' "$i" "$NSTRAT" "$(strat_name "$i")" \
-      "$(score_mark "$SCORE_Y" "$NY")" "$(score_mark "$SCORE_D" "$ND")"
-    [ -n "$LAST_FAIL" ] && printf '  %sне открылось: %s%s' "$D" "$LAST_FAIL" "$N"
-    [ -n "$LAST_CUT" ] && { printf '  %sобрыв на 16 КБ: %s%s' "$D" "$LAST_CUT" "$N"; SEL_CUT=$LAST_CUT; }
-    printf '\n'
-    [ "$SCORE_Y" -gt "$sy" ] && { by=$i; sy=$SCORE_Y; }
-    [ "$SCORE_D" -gt "$sd" ] && { bd=$i; sd=$SCORE_D; }
-    [ "$1" != all ] && [ "$sy" -eq "$NY" ] && [ "$sd" -eq "$ND" ] && break
+    CHECK_ONLY=$only; run_checks "socks:$TEST_PORT"; stop_test; CHECK_ONLY=""
+    if [ "$ut" = 1 ]; then sel_line "$i" "$NSTRAT" "$(strat_name "$i")" Y
+    else sel_line "$i" "$NSTRAT" "$(strat_name "$i")" Y D; fi
+    [ "$SCORE_Y" -gt "$tsy" ] && { by=$i; tsy=$SCORE_Y; }
+    [ "$ut" = 1 ] || { [ "$SCORE_D" -gt "$sd" ] && { bd=$i; sd=$SCORE_D; }; }
+    [ "$1" != all ] && [ "$tsy" -eq "$NY" ] && { [ "$ut" = 1 ] || [ "$sd" -eq "$ND" ]; } && break
   done
+  sy=$tsy; yt=tpws
+
+  if [ "$ut" = 1 ]; then
+    say ""
+    say "${B}Discord через utunws${N}"
+    for (( i=1; i<=NUT; i++ )); do
+      if ! ut_try_start "$i"; then
+        printf ' [%2d/%d] %-10s не запустилась\n' "$i" "$NUT" "$(ut_strat_name "$i")"
+        continue
+      fi
+      CHECK_ONLY=D; run_checks direct; ut_try_stop; CHECK_ONLY=""
+      sel_line "$i" "$NUT" "$(ut_strat_name "$i")" D
+      [ "$SCORE_D" -gt "$sd" ] && { ud=$i; sd=$SCORE_D; }
+      [ "$1" != all ] && [ "$sd" -eq "$ND" ] && break
+    done
+    if [ "$1" = all ] || [ "$tsy" -lt "$NY" ]; then
+      say ""
+      say "${B}YouTube через utunws${N}"
+      if ut_try_start "$ud" 1; then
+        CHECK_ONLY=Y; run_checks direct; ut_try_stop; CHECK_ONLY=""
+        sel_line 1 1 HOSTFAKESPLIT Y
+        [ "$SCORE_Y" -gt "$tsy" ] && { yt=utunws; sy=$SCORE_Y; }
+      else
+        say "   не запустился"
+      fi
+    fi
+  fi
   test_env_down
   trap - INT TERM HUP
-  SEL_Y=$by; SEL_D=$bd; SEL_SY=$sy; SEL_SD=$sd
-  [ "$sy" -ge 0 ]
+  SEL_Y=$by; SEL_STY=$tsy; SEL_YT=$yt; SEL_SY=$sy; SEL_UT=$ut; SEL_SD=$sd
+  if [ "$ut" = 1 ]; then SEL_D=$ud; else SEL_D=$bd; fi
+  [ "$sy" -ge 0 ] || [ "$sd" -ge 0 ]
 }
 
-report_group() {   # $1 = название, $2 = стратегия, $3 = балл, $4 = из скольких
-  if [ "$3" -eq "$4" ]; then ok "$1: стратегия $2 ($(strat_name "$2")) — открывается всё"
-  else warn "$1: лучшая — стратегия $2 ($(strat_name "$2")): $3 из $4. Часть может не работать."; fi
+report_group() {   # $1 = название, $2 = что выбрано, $3 = балл, $4 = из скольких
+  if [ "$3" -eq "$4" ]; then ok "$1: $2 — открывается всё"
+  else warn "$1: лучшее — $2: $3 из $4. Часть может не работать."; fi
 }
+
+# сохраняет итог подбора в настройки
+sel_save() {
+  [ "$SEL_STY" -gt 0 ] && cfg_set S_Y "$SEL_Y"
+  [ "$SEL_UT" = 1 ] && [ "$SEL_SY" -gt 0 ] && cfg_set YT "$SEL_YT"
+  if [ "$SEL_SD" -gt 0 ]; then
+    if [ "$SEL_UT" = 1 ]; then cfg_set UT_D "$SEL_D"; else cfg_set S_D "$SEL_D"; fi
+  fi
+}
+
+# что сейчас выбрано, для сообщений
+yt_desc() { if [ "$(yt_engine)" = utunws ] && ut_wanted; then printf 'utunws'; else printf 'tpws, %s' "$(strat_name "$(strat_of Y)")"; fi; }
+ds_desc() { if ut_wanted; then printf 'utunws, %s' "$(ut_strat_name "$(ut_of)")"; else printf 'tpws, %s' "$(strat_name "$(strat_of D)")"; fi; }
 
 cmd_test() {   # $1 = all — прогнать все, иначе остановиться, когда нашлись рабочие для обоих
   ensure_installed
+  [ "$(cfg MODE transparent)" = transparent ] && ut_ensure
   select_strategies "$1" || return 1
   say ""
   if [ "$SEL_SY" -le 0 ] && [ "$SEL_SD" -le 0 ]; then
@@ -1231,17 +1375,17 @@ cmd_test() {   # $1 = all — прогнать все, иначе останов
     say "   Что попробовать: пункт «DNS Google/Cloudflare» и подбор заново; другая сеть; на это время — VPN."
     return 1
   fi
-  if [ "$SEL_SY" -gt 0 ]; then cfg_set S_Y "$SEL_Y"; report_group YouTube "$SEL_Y" "$SEL_SY" "$NY"
-  else warn "YouTube не открылся ни с одной стратегией — оставил прежнюю."; fi
-  if [ "$SEL_SD" -gt 0 ]; then cfg_set S_D "$SEL_D"; report_group Discord "$SEL_D" "$SEL_SD" "$ND"
+  sel_save
+  if [ "$SEL_SY" -gt 0 ]; then report_group YouTube "$(yt_desc)" "$SEL_SY" "$NY"
+  else warn "YouTube не открылся ни одним способом — оставил прежний."; fi
+  if [ "$SEL_SD" -gt 0 ]; then report_group Discord "$(ds_desc)" "$SEL_SD" "$ND"
   else warn "Discord не открылся ни с одной стратегией — оставил прежнюю."; fi
-  cut_note "$SEL_CUT" tpws
-  if ut_wanted; then
-    say "   ${D}Discord на Cloudflare и звонки идут через utunws, стратегия tpws для Discord нужна остальным его адресам.${N}"
+  if [ "$SEL_UT" = 1 ]; then
+    say "   ${D}Звонки Discord идут через utunws.${N}"
   else
     say "   ${D}Звонки Discord идут по UDP, а tpws умеет только TCP. Если голос не подключается — на время звонка включи VPN.${N}"
   fi
-  log "Подбор: YouTube — $SEL_Y ($SEL_SY/$NY), Discord — $SEL_D ($SEL_SD/$ND)"
+  log "Подбор: YouTube — $(yt_desc) ($SEL_SY/$NY), Discord — $(ds_desc) ($SEL_SD/$ND)"
   return 0
 }
 
@@ -1274,7 +1418,35 @@ cmd_choose() {
     *) { [ "$n" -ge 1 ] && [ "$n" -le "$NSTRAT" ]; } || { err "Нет такой стратегии"; return; }; d=$n ;;
   esac
   cfg_set S_Y "$y"; cfg_set S_D "$d"
+  if ut_selectable; then cmd_choose_ut || return; fi
   cmd_start
+}
+
+# с utunws Discord идёт через него, а YouTube — через tpws или через него
+cmd_choose_ut() {
+  local i n u yt
+  u=$(ut_of); yt=$(yt_engine)
+  say ""
+  say "Discord идёт через utunws. Его стратегии:"
+  for (( i=1; i<=NUT; i++ )); do
+    printf '  %2d  %-10s' "$i" "$(ut_strat_name "$i")"
+    [ "$i" = "$u" ] && printf '  %s← сейчас%s' "$B" "$N"
+    printf '\n'
+  done
+  printf 'Стратегия utunws для Discord (Enter — оставить %s): ' "$u"
+  read -r n
+  case $n in
+    '') ;;
+    *[!0-9]*) err "Нет такой стратегии"; return 1 ;;
+    *) { [ "$n" -ge 1 ] && [ "$n" -le "$NUT" ]; } || { err "Нет такой стратегии"; return 1; }; u=$n ;;
+  esac
+  printf 'YouTube через tpws или utunws? [t/u] (Enter — оставить %s): ' "$yt"
+  read -r n
+  case $n in
+    t|T|т|Т|tpws) yt=tpws ;;
+    u|U|г|Г|utunws) yt=utunws ;;
+  esac
+  cfg_set UT_D "$u"; cfg_set YT "$yt"
 }
 
 cmd_check() {
@@ -1291,12 +1463,21 @@ cmd_check() {
     say "${B}Обход наготове — так будет, когда выключишь VPN:${N}"
     if test_env_up; then
       trap 'stop_test; test_env_down; exit 130' INT TERM HUP
-      if start_test cur "$PHYS_IP"; then run_checks "socks:$TEST_PORT"; print_checks; cut_note "$LAST_CUT" tpws; fi
-      stop_test
+      # что идёт через tpws: всё, а с utunws — только YouTube, и то если он не через utunws
+      if ! ut_active || [ "$(yt_engine)" = tpws ]; then
+        if start_test cur "$PHYS_IP"; then
+          ut_active && { CHECK_ONLY=Y; say "   ${D}YouTube — через tpws:${N}"; }
+          run_checks "socks:$TEST_PORT"; CHECK_ONLY=""
+          print_checks
+        fi
+        stop_test
+      fi
       if ut_test_on; then
-        say "${B}Discord через utunws:${N}"
-        CHECK_ONLY=D; run_checks utun; CHECK_ONLY=""
-        print_checks; cut_note "$LAST_CUT" apps
+        CHECK_ONLY=D
+        if [ "$(yt_engine)" = utunws ]; then CHECK_ONLY=""; say "   ${D}YouTube и Discord — через utunws:${N}"
+        else say "   ${D}Discord — через utunws:${N}"; fi
+        run_checks utun; CHECK_ONLY=""
+        print_checks
         ut_test_off
       fi
       test_env_down
@@ -1312,9 +1493,8 @@ cmd_check() {
   if [ "$mode" = socks ]; then run_checks "socks:$SOCKS_PORT"; else run_checks apps; fi
   print_checks
   if [ "$SCORE_Y" -ne "$NY" ] || [ "$SCORE_D" -ne "$ND" ]; then warn "Не всё открывается — подбери стратегии заново (пункт 1)."
-  elif [ -z "$LAST_CUT" ]; then ok "YouTube и Discord открываются$(ut_active && printf ' (Discord — через utunws)')."
+  else ok "YouTube и Discord открываются (YouTube — $(yt_desc), Discord — $(ds_desc))."
   fi
-  cut_note "$LAST_CUT" "$([ "$mode" = socks ] && echo tpws || echo apps)"
 }
 
 cmd_status() {
@@ -1323,14 +1503,14 @@ cmd_status() {
   say ""
   if [ -x "$TPWS" ]; then ok "tpws установлен: $(cat "$DIR/zapret-version" 2>/dev/null) · zapret-mac $ZM_VERSION"; else warn "tpws ещё не установлен"; fi
   say "   Режим: $(mode_name)"
-  say "   Стратегии: YouTube — $(strat_of Y) ($(strat_name "$(strat_of Y)")), Discord — $(strat_of D) ($(strat_name "$(strat_of D)"))"
+  say "   YouTube — $(yt_desc), Discord — $(ds_desc); остальные сайты из списков — tpws, $(strat_name "$(strat_of D)")"
   if job_loaded "$LBL_TPWS" && tpws_up "$mode"; then ok "tpws работает на 127.0.0.1:$(main_port "$mode")"
   elif job_loaded "$LBL_TPWS"; then warn "tpws запущен, но порт $(main_port "$mode") не отвечает — смотри лог: $LOGS/tpws.log"
   else say "   tpws не запущен"; fi
   if [ "$(cfg UTUNWS 1)" != 1 ]; then say "   utunws для Discord выключен в настройках (пункт 9 → 5)"
   elif [ ! -x "$UTUNWS" ]; then warn "utunws не установлен — Discord идёт через tpws. Установить — пункт 13 «Обновить»"
   elif [ "$mode" != transparent ]; then say "   utunws не используется: он работает только в прозрачном режиме"
-  elif ut_up; then ok "utunws работает на $UT_IF ($(cat "$DIR/utunws-version" 2>/dev/null)): Discord и звонки — с поддельными пакетами"
+  elif ut_up; then ok "utunws работает на $UT_IF ($(cat "$DIR/utunws-version" 2>/dev/null)): Discord — $(ut_strat_name "$(ut_of)")$([ "$(yt_engine)" = utunws ] && printf ', YouTube — тоже через него')"
   elif job_loaded "$LBL_UT"; then warn "utunws запущен, но $UT_IF не поднялся — смотри лог: $LOGS/utunws.log"
   else say "   utunws не запущен"; fi
   if job_loaded "$LBL_WD"; then
@@ -1500,7 +1680,7 @@ cmd_autolist() {
   say ""
   say "Автосписок — сюда tpws сам добавляет сайты, на которых заметил блокировку: ${n:-0}"
   if [ "$(cfg AUTOLIST 0)" = 1 ]; then say "   Сейчас: ${G}включён${N}"
-  else say "   Сейчас: выключен — включается в «Настройках» (пункт 9). ${D}Может сломать сайты на Cloudflare у провайдеров с обрывом на 16 КБ.${N}"; fi
+  else say "   Сейчас: выключен — включается в «Настройках» (пункт 9). ${D}Может сломать сайты, которые и так работали.${N}"; fi
   [ "${n:-0}" -gt 0 ] && sed 's/^/   /' "$f"
   say "${D}Если какой-то сайт попал сюда зря и стал хуже работать — добавь его в $LISTS/list-exclude-user.txt${N}"
   [ "${n:-0}" -gt 0 ] || return 0
@@ -1580,7 +1760,8 @@ cmd_update() {
   fi
   # utunws обновляется вместе со скриптом: версия и контрольные суммы зашиты в него
   if [ "$(cfg UTUNWS 1)" = 1 ]; then
-    if [ -x "$UTUNWS" ] && [ "$(cat "$DIR/utunws-version" 2>/dev/null)" = "$UTUNWS_TAG" ]; then ok "utunws $UTUNWS_TAG на месте"
+    if [ -x "$UTUNWS" ] && [ -f "${UTUNWS%/*}/tls_clienthello_4pda_to.bin" ] &&
+       [ "$(cat "$DIR/utunws-version" 2>/dev/null)" = "$UTUNWS_TAG" ]; then ok "utunws $UTUNWS_TAG на месте"
     else install_utunws || warn "utunws не обновлён — Discord пойдёт через tpws."; fi
   fi
   say "Обновляю списки доменов Flowseal…"
@@ -1622,7 +1803,7 @@ cmd_uninstall() {
 # Плюс раз в CHECK_EVERY секунд (и после смены сети) проверяет YouTube и Discord
 # и при сбое сам подбирает стратегии в фоне.
 WD_STATE=""; WD_VPN=""; WD_NET=""; FAILS=0; NEXT_CHECK=0; BACKOFF=$CHECK_EVERY
-SEL_PID=""; LAST_FULL=0; FAIL_NOTIFIED=0; CUT_NOTIFIED=0
+SEL_PID=""; LAST_FULL=0; FAIL_NOTIFIED=0
 
 wd_status() { printf '%s %s\n' "$1" "$2" > "$RUN/status.new" && chmod 644 "$RUN/status.new" && mv -f "$RUN/status.new" "$RUN/status"; }
 
@@ -1699,9 +1880,10 @@ sel_start() {
   log "YouTube или Discord не открываются — подбираю стратегии (ход подбора: $LOGS/select.log)"
   rm -f "$RUN/select.result"
   (
-    trap 'stop_test; exit 1' TERM
+    trap 'stop_test; ut_try_stop; exit 1' TERM
     select_strategies auto > "$LOGS/select.log" 2>&1 &&
-      printf '%s %s %s %s %s\n' "$SEL_PATH" "$SEL_Y" "$SEL_D" "$SEL_SY" "$SEL_SD" > "$RUN/select.result"
+      printf '%s %s %s %s %s %s %s %s\n' "$SEL_PATH" "$SEL_Y" "$SEL_STY" "$SEL_YT" "$SEL_SY" "$SEL_UT" "$SEL_D" "$SEL_SD" \
+        > "$RUN/select.result"
   ) &
   SEL_PID=$!
 }
@@ -1714,22 +1896,20 @@ sel_stop() {
 }
 
 sel_poll() {
-  local r p y d sy sd cur_y cur_d
+  local r p sy sd old_tp old_ut
   [ -n "$SEL_PID" ] || return 0
   kill -0 "$SEL_PID" 2>/dev/null && return 0
   wait "$SEL_PID" 2>/dev/null; SEL_PID=""
   r=$(cat "$RUN/select.result" 2>/dev/null); rm -f "$RUN/select.result"
   if [ -z "$r" ]; then log "Подбор не удался — подробности в $LOGS/select.log"; return 0; fi
   set -f; set -- $r; set +f
-  p=$1; y=$2; d=$3; sy=$4; sd=$5
-  cur_y=$(strat_of Y); cur_d=$(strat_of D)
-  # стратегия, с которой не открылось ничего, ничем не лучше текущей
-  [ "$sy" -gt 0 ] || y=$cur_y
-  [ "$sd" -gt 0 ] || d=$cur_d
+  p=$1; SEL_Y=$2; SEL_STY=$3; SEL_YT=$4; SEL_SY=$5; SEL_UT=$6; SEL_D=$7; SEL_SD=$8
+  sy=$SEL_SY; sd=$SEL_SD
   if [ "$p" = 1 ]; then
-    log "Стратегии рабочие — перезапускаю tpws и перенаправление"
+    log "Стратегии рабочие — перезапускаю tpws, utunws и перенаправление"
     fw_off
     launchctl kickstart -k "system/$LBL_TPWS" >/dev/null 2>&1
+    [ -f "$PL_UT" ] && launchctl kickstart -k "system/$LBL_UT" >/dev/null 2>&1
     wait_bound "$(main_port)" 50
     if [ "$(cfg MODE transparent)" = transparent ]; then
       fw_try >/dev/null 2>&1
@@ -1742,14 +1922,17 @@ sel_poll() {
     NEXT_CHECK=$(( SECONDS + 60 ))
     return 0
   fi
-  if [ "$y" != "$cur_y" ] || [ "$d" != "$cur_d" ]; then
-    cfg_set S_Y "$y"; cfg_set S_D "$d"
-    if tpws_apply "$(cfg MODE transparent)" >/dev/null 2>&1; then
-      log "Новые стратегии: YouTube — $y ($(strat_name "$y")) $sy/$NY, Discord — $d ($(strat_name "$d")) $sd/$ND"
-      notify "Обход перенастроен: YouTube — $(strat_name "$y"), Discord — $(strat_name "$d")"
-    else
-      log "tpws не запустился с новыми стратегиями"
+  old_tp="$(strat_of Y) $(strat_of D)"; old_ut="$(ut_of) $(yt_engine)"
+  sel_save   # то, что не открыло ничего, sel_save не сохраняет
+  if [ "$old_tp" != "$(strat_of Y) $(strat_of D)" ] || [ "$old_ut" != "$(ut_of) $(yt_engine)" ]; then
+    [ "$old_tp" != "$(strat_of Y) $(strat_of D)" ] && { tpws_apply "$(cfg MODE transparent)" >/dev/null 2>&1 || log "tpws не запустился с новыми стратегиями"; }
+    if [ "$old_ut" != "$(ut_of) $(yt_engine)" ]; then
+      fw_loaded && fw_on >/dev/null 2>&1   # YouTube мог уйти из utunws — сначала правила
+      ut_apply >/dev/null 2>&1 || log "utunws не запустился с новыми стратегиями"
+      fw_loaded && fw_on >/dev/null 2>&1
     fi
+    log "Новые стратегии: YouTube — $(yt_desc) $sy/$NY, Discord — $(ds_desc) $sd/$ND"
+    notify "Обход перенастроен: YouTube — $(yt_desc), Discord — $(ds_desc)"
   fi
   if [ "$sy" -lt "$NY" ] || [ "$sd" -lt "$ND" ]; then
     log "Полностью рабочих стратегий нет: YouTube $sy/$NY, Discord $sd/$ND"
@@ -1788,21 +1971,6 @@ health_tick() {
   # интернета нет вообще — это не блокировка, подбирать нечего
   /usr/bin/curl -s -o /dev/null --noproxy '*' --interface "$PHYS" --connect-timeout 5 --max-time 8 "$CONTROL_URL" || return 0
   if [ "$(cfg MODE transparent)" = socks ]; then run_checks "socks:$SOCKS_PORT"; else run_checks apps; fi
-  # обрыв на 16 КБ стратегией не лечится — сообщаем один раз и подбор из-за него не запускаем
-  if [ -n "$LAST_CUT" ]; then
-    if [ "$CUT_NOTIFIED" != 1 ]; then
-      if ut_active; then
-        log "Обрыв после 16 КБ: $LAST_CUT — даже через utunws. Лог: $LOGS/utunws.log"
-        notify "Discord режется после 16 КБ даже через utunws — для Discord включи VPN"
-      else
-        log "Обрыв после 16 КБ: $LAST_CUT — провайдер режет Cloudflare без видимого имени сайта, нужен utunws или VPN"
-        notify "Discord на этом провайдере режется после 16 КБ — для Discord включи VPN"
-      fi
-      CUT_NOTIFIED=1
-    fi
-  else
-    CUT_NOTIFIED=0
-  fi
   if [ "$SCORE_Y" -eq "$NY" ] && [ "$SCORE_D" -eq "$ND" ]; then
     { [ "$FAILS" -gt 0 ] || [ "$FAIL_NOTIFIED" = 1 ]; } && log "Проверка: YouTube и Discord снова открываются"
     FAILS=0; FAIL_NOTIFIED=0; BACKOFF=$CHECK_EVERY
@@ -1876,8 +2044,7 @@ menu_status() {
   local st="" v="" names
   [ -f "$PL_TPWS" ] || { printf '%sвыключен%s' "$D" "$N"; return; }
   [ -f "$RUN/status" ] && read -r st v < "$RUN/status"
-  names="YouTube — $(strat_name "$(strat_of Y)"), Discord — $(strat_name "$(strat_of D)")"
-  ut_active && names="$names + utunws"
+  names="YouTube — $(yt_desc), Discord — $(ds_desc)"
   if ! pgrep -f "$SELF daemon" >/dev/null 2>&1; then
     printf '%sвключён, но сторож не работает%s — выбери 2' "$R" "$N"
     return

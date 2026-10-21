@@ -10,7 +10,7 @@
 ![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon%20%7C%20Intel-black?logo=apple)
 ![bash](https://img.shields.io/badge/bash-3.2-4EAA25?logo=gnubash&logoColor=white)
 
-[Установка](#установка) · [Как это работает](#как-это-работает) · [Как обходится блокировка Discord](#как-обходится-блокировка-discord) · [Если пропал интернет](#если-пропал-интернет)
+[Установка](#установка) · [Как это работает](#как-это-работает) · [Как обходится блокировка](#как-обходится-блокировка) · [Если пропал интернет](#если-пропал-интернет)
 
 </div>
 
@@ -18,13 +18,13 @@
 
 На Windows есть готовая сборка [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube). На macOS она не запускается: winws и драйвер WinDivert существуют только для Windows. zapret-mac берёт два движка, которые на macOS работают: tpws из zapret для YouTube и utunws из [macOS-порта Flowseal](https://github.com/Flowseal/zapret-mac-discord-youtube) для Discord. Вокруг них — прозрачное перенаправление через pf, подбор стратегий, автозапуск и сторож, который уступает дорогу VPN.
 
-> **Новое в 2.2:** Discord работает без VPN целиком — приложение, чаты и звонки. Подробности — в [CHANGELOG.md](CHANGELOG.md).
+> **Новое в 2.3:** работает и на мобильном интернете. Подбор сам выбирает стратегию utunws для Discord и способ обхода YouTube под текущую сеть — домашний провайдер или раздача с телефона. Подробности — в [CHANGELOG.md](CHANGELOG.md).
 
 ## Возможности
 
 - **Прозрачный режим, как в оригинальном zapret.** pf перенаправляет исходящий TCP на порты 80 и 443 в tpws, поэтому обход видят все программы. В том числе апдейтер Discord: он написан на Rust и системный SOCKS-прокси игнорирует.
-- **Discord через utunws — с поддельными пакетами, как на Windows.** utunws — это nfqws из zapret, который получает пакеты через интерфейс `utun` и отправляет их через BPF. Перед настоящим TLS-приветствием он шлёт поддельное с именем `www.google.com`, поэтому не срабатывает ни блокировка по имени `discord.com`, ни обрыв Cloudflare после 16 КБ. Через него же идёт голос по UDP. Выключается в настройках (пункт 9 → 5).
-- **Отдельные стратегии для YouTube и для Discord.** Подбор перебирает 16 стратегий tpws и для каждой группы сайтов выбирает свою.
+- **Discord через utunws — с поддельными пакетами, как на Windows.** utunws — это nfqws из zapret, который получает пакеты через интерфейс `utun` и отправляет их через BPF. Поэтому он может делать то же, что winws на Windows: отправлять поддельные пакеты и пересобирать TLS-приветствие. Через него же идёт голос по UDP. Выключается в настройках (пункт 9 → 5).
+- **Подбор под каждую сеть.** Для Discord подбирается одна из трёх стратегий utunws, для YouTube — одна из 16 стратегий tpws, а если tpws открывает не всё, ещё и вариант через utunws. Сменилась сеть и что-то перестало открываться — сторож подбирает заново.
 - **Автопереключение с VPN.** Сторож ловит события маршрутизации. VPN в режиме TUN включился — перенаправление снимается, весь трафик идёт в VPN. Выключился — обход возвращается.
 - **Самопроверка.** Раз в 30 минут и после смены сети сторож открывает YouTube и Discord. Если перестали открываться, подбирает стратегии в фоне и присылает уведомление.
 - **Подбор при включённом VPN.** Тестовый трафик уходит к провайдеру напрямую через Wi‑Fi, мимо туннеля. Перед подбором скрипт сверяет внешний IP, чтобы проверка правда шла мимо VPN.
@@ -41,7 +41,7 @@
 | Приложение Discord | ✓ через utunws | ✓ |
 | Звонки в Discord (UDP) | ✓ через utunws | ✓ |
 
-Проверено с выключенным VPN: приложение Discord, чаты и звонки работают. Если у твоего провайдера что-то не открывается, напиши в [Issues](https://github.com/getpaintoo/zapret-mac/issues).
+Проверено с выключенным VPN на домашнем провайдере и на мобильном интернете МегаФона (раздача с iPhone). Если у твоего провайдера что-то не открывается, напиши в [Issues](https://github.com/getpaintoo/zapret-mac/issues).
 
 ## Установка
 
@@ -106,14 +106,14 @@ bash zapret-mac.sh stop        # выключить
 
 Подробно: [docs/architecture.md](docs/architecture.md).
 
-## Как обходится блокировка Discord
+## Как обходится блокировка
 
-Провайдеры мешают Discord двумя способами:
+Провайдер смотрит на начало каждого HTTPS-соединения: там открытым текстом видно имя сайта, например `discord.com`. Если имя в чёрном списке, соединение не пропускается. Обход сбивает эту проверку, и способ зависит от сети:
 
-1. блокируют соединение, если в начале TLS видно имя `discord.com`;
-2. обрывают после ~16 КБ соединения с адресами Cloudflare, в которых не смогли прочитать имя сайта.
+- **tpws** режет TLS-приветствие на части и меняет их порядок, так что имя целиком не видно. Этого хватает для YouTube у большинства домашних провайдеров.
+- **utunws** работает с пакетами напрямую и умеет больше. Например, перед настоящим приветствием отправляет поддельное с именем `www.google.com`, которое сервер выбросит (`fake`). Или накладывает на начало приветствия чужие данные (`seqovl`).
 
-utunws перед настоящим TLS-приветствием отправляет поддельное — с именем `www.google.com` и испорченной меткой времени TCP. Провайдер читает разрешённое имя и пропускает соединение, а сервер подделку выбрасывает и получает настоящее приветствие. Ни одно из правил не срабатывает, и Discord открывается целиком. Голос по UDP utunws проводит так же, с поддельным пакетом Discord перед настоящими.
+Провайдеры относятся к этим приёмам по-разному. На домашнем провайдере Discord проходит и с `fake`, и с `seqovl`, а мобильный МегаФон пропускает только `seqovl`. YouTube на МегаФоне через tpws почти не открывается, а через utunws (`hostfakesplit`) открывается целиком. Поэтому подбор проверяет варианты на текущей сети и оставляет те, с которыми всё открывается.
 
 Подробно, вместе с правилами pf: [docs/architecture.md](docs/architecture.md#utunws).
 
@@ -175,6 +175,6 @@ zapret-mac brings [zapret](https://github.com/bol-van/zapret) DPI circumvention 
 
 Install: `curl -fLO https://raw.githubusercontent.com/getpaintoo/zapret-mac/main/zapret-mac.sh && bash zapret-mac.sh`, then choose 1 in the menu.
 
-Discord goes through utunws: before the real TLS ClientHello it sends a fake one for www.google.com, so the ISP lets the connection through. The Discord app, chats and voice calls work without a VPN. Details: [docs/architecture.md](docs/architecture.md#utunws) (in Russian).
+Discord goes through utunws, YouTube through tpws or utunws; the strategy selection tests the options on the current network (home ISP or a mobile hotspot) and keeps the ones that open everything. The Discord app, chats and voice calls work without a VPN. Details: [docs/architecture.md](docs/architecture.md#utunws) (in Russian).
 
 </details>

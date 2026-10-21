@@ -1,8 +1,8 @@
 #!/bin/bash
 # Проверяет, что tpws принимает все стратегии zapret-mac: основной процесс
 # в обоих режимах (с автосписком и без) и временный процесс для подбора.
-# Если указан utunws — что он принимает параметры для Discord (поддельные
-# пакеты должны лежать рядом с ним). Работает без root и ничего в системе не меняет.
+# Если указан utunws — что он принимает все его стратегии, с YouTube и без
+# (поддельные пакеты должны лежать рядом с ним). Работает без root и ничего в системе не меняет.
 #
 #   ZM_TPWS=/путь/к/tpws [ZM_UTUNWS=/путь/к/utunws] bash tests/dry-run.sh
 
@@ -46,14 +46,18 @@ for s in $(seq 1 "$NSTRAT") cur; do
 done
 
 if [ -x "${ZM_UTUNWS:-}" ]; then
-  build_ut_args
-  A=()
-  for a in "${UT_ARGS[@]}"; do case $a in --user=*) ;; *) A+=("$a") ;; esac; done
-  runs=$(( runs + 1 ))
-  if ! out=$("$UTUNWS" "${A[@]}" --dry-run 2>&1); then
-    printf '%s\n' "$out" | tail -n 2
-    echo "FAIL: utunws для Discord"; fails=$(( fails + 1 ))
-  fi
+  for (( u=1; u<=NUT; u++ )); do
+    for yt in "" 1; do
+      build_ut_args "$u" "$yt"
+      A=()
+      for a in "${UT_ARGS[@]}"; do case $a in --user=*) ;; *) A+=("$a") ;; esac; done
+      runs=$(( runs + 1 ))
+      if ! out=$("$UTUNWS" "${A[@]}" --dry-run 2>&1); then
+        printf '%s\n' "$out" | tail -n 2
+        echo "FAIL: utunws, стратегия $u ($(ut_strat_name "$u")), YouTube=${yt:-0}"; fails=$(( fails + 1 ))
+      fi
+    done
+  done
 else
   echo "utunws не указан (ZM_UTUNWS) — его параметры не проверены"
 fi
