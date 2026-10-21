@@ -14,7 +14,7 @@
 
 ```bash
 /bin/bash -n zapret-mac.sh
-ZM_TPWS=/opt/zapret-mac/bin/tpws bash tests/dry-run.sh
+ZM_TPWS=/opt/zapret-mac/bin/tpws ZM_UTUNWS=/opt/zapret-mac/bin/utunws bash tests/dry-run.sh
 ```
 
 Новые стратегии добавляй в массив `STRATEGIES` и прогоняй `tests/dry-run.sh`: если tpws не примет параметры, тест упадёт. Если стратегия помогла у твоего провайдера, напиши в описании, что именно стало открываться.

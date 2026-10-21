@@ -23,7 +23,18 @@ jobs:
           echo "$sum  zapret-$tag/binaries/mac64/tpws" | shasum -a 256 -c
           echo "ZM_TPWS=$PWD/zapret-$tag/binaries/mac64/tpws" >> "$GITHUB_ENV"
 
-      - name: tpws принимает все стратегии
+      - name: Скачать utunws той версии, что зашита в скрипт
+        run: |
+          url=$(sed -n 's/^UTUNWS_URL="\(.*\)"$/\1/p' zapret-mac.sh)
+          tag=$(sed -n 's/^UTUNWS_TAG="\(.*\)"$/\1/p' zapret-mac.sh)
+          sum=$(sed -n 's/^UTUNWS_SHA256="\(.*\)"$/\1/p' zapret-mac.sh)
+          curl -fsSL -o ut.zip "${url//\$UTUNWS_TAG/$tag}"
+          p=ZapretMac.app/Contents/Resources/Payload/bin
+          unzip -q ut.zip "$p/utunws" "$p/tls_clienthello_www_google_com.bin" "$p/ACTIVE_DISCORD_UDP.bin"
+          echo "$sum  $p/utunws" | shasum -a 256 -c
+          echo "ZM_UTUNWS=$PWD/$p/utunws" >> "$GITHUB_ENV"
+
+      - name: tpws и utunws принимают все стратегии
         run: /bin/bash tests/dry-run.sh
 
   shellcheck:
