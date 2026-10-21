@@ -2,6 +2,11 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [Unreleased]
+
+### Добавлено
+- Для Discord можно подключить Linux VM с zapret/nfqws через ограниченный SSH SOCKS-туннель; добавлена инструкция по Bridged VM.
+
 ## [2.1] — 2026-10-21
 
 ### Добавлено

@@ -41,6 +41,7 @@ DNS_BACKUP="$DIR/dns-backup"
 TP_PORT=988          # tpws в прозрачном режиме (сюда pf заворачивает трафик)
 SOCKS_PORT=1080      # tpws в режиме SOCKS-прокси
 TEST_PORT=1090       # временный tpws для подбора стратегий
+DISCORD_VM_PROXY_PORT=1081  # SOCKS из ssh-туннеля к Linux VM с nfqws
 LBL_TPWS="com.zapret-mac.tpws"
 LBL_WD="com.zapret-mac.watchdog"
 PL_TPWS="/Library/LaunchDaemons/$LBL_TPWS.plist"
@@ -299,7 +300,7 @@ cut_note() {
   say  "   не может прочитать имя сайта, режутся после 16 КБ. А прятать имя — и есть работа tpws."
   say  "   Flowseal на Windows обходит это поддельными пакетами, на macOS их отправить нельзя."
   say  "   Обновления Discord это не задевает (они качаются с Google Cloud), а само приложение"
-  say  "   Discord живёт на Cloudflare — для него на этом провайдере нужен VPN."
+  say  "   Для Discord на этом провайдере нужен VPN, Linux VM с nfqws или Linux-роутер с zapret."
 }
 
 score_mark() {
@@ -1107,20 +1108,77 @@ cmd_status() {
   warn_other_proxies
 }
 
+discord_vm_connect() {
+  local target=$1 dir ctl target_file old
+  case $target in
+    ""|-*|*[!A-Za-z0-9._@-]*) err "Неверная SSH-цель Linux VM: $target"; return 1 ;;
+  esac
+  command -v ssh >/dev/null 2>&1 || { err "В macOS не найден ssh."; return 1; }
+  dir="$HOME/Library/Application Support/zapret-mac"
+  ctl="$dir/discord-vm.sock"
+  target_file="$dir/discord-vm.target"
+  mkdir -p "$dir" && chmod 700 "$dir" || { err "Не удалось создать $dir"; return 1; }
+  if [ -f "$target_file" ]; then
+    old=$(cat "$target_file")
+    if [ "$old" = "$target" ] && ssh -S "$ctl" -O check "$old" >/dev/null 2>&1; then
+      wait_port "$DISCORD_VM_PROXY_PORT" 20 && return 0
+    fi
+    [ -n "$old" ] && ssh -S "$ctl" -O exit "$old" >/dev/null 2>&1
+  fi
+  rm -f "$ctl" "$target_file"
+  if port_listening "$DISCORD_VM_PROXY_PORT"; then
+    err "Локальный порт $DISCORD_VM_PROXY_PORT занят. Закрой другую программу или поменяй DISCORD_VM_PROXY_PORT."
+    return 1
+  fi
+  printf '%s\n' "$target" > "$target_file" && chmod 600 "$target_file" || return 1
+  if ! ssh -M -S "$ctl" -f -N -D "127.0.0.1:$DISCORD_VM_PROXY_PORT" \
+       -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "$target"; then
+    rm -f "$target_file"
+    err "Не удалось поднять SSH-туннель к $target. Проверь IP, логин и доступность VM."
+    return 1
+  fi
+  if ! wait_port "$DISCORD_VM_PROXY_PORT" 30; then
+    ssh -S "$ctl" -O exit "$target" >/dev/null 2>&1
+    rm -f "$ctl" "$target_file"
+    err "SSH подключился, но локальный SOCKS-порт не открылся."
+    return 1
+  fi
+}
+
+cmd_discord_vm_stop() {
+  local dir="$HOME/Library/Application Support/zapret-mac" ctl target_file target
+  ctl="$dir/discord-vm.sock"
+  target_file="$dir/discord-vm.target"
+  [ -f "$target_file" ] || { say "SSH-туннель Discord не запущен."; return 0; }
+  target=$(cat "$target_file")
+  if [ -n "$target" ]; then ssh -S "$ctl" -O exit "$target" >/dev/null 2>&1; fi
+  rm -f "$ctl" "$target_file"
+  ok "SSH-туннель к Linux VM остановлен."
+}
+
 cmd_discord() {   # от имени пользователя
-  local app="" p i
+  local app="" p i vm=""
   for p in "/Applications/Discord.app" "$HOME/Applications/Discord.app"; do
     [ -d "$p" ] && { app=$p; break; }
   done
   [ -n "$app" ] || die "Discord не найден в «Программах»."
-  [ -f "$PL_TPWS" ] || die "Сначала включи обход (пункт 1 или 2)."
+  vm=$(cfg NFQWS_VM "")
+  [ -n "$vm" ] || [ -f "$PL_TPWS" ] || die "Сначала включи обход (пункт 1 или 2)."
   if pgrep -x Discord >/dev/null 2>&1; then
     osascript -e 'tell application "Discord" to quit' >/dev/null 2>&1
     for (( i=0; i<30; i++ )); do pgrep -x Discord >/dev/null 2>&1 || break; sleep 0.3; done
     pkill -x Discord >/dev/null 2>&1
     sleep 1
   fi
-  if [ "$(cfg MODE transparent)" = socks ]; then
+  if [ -n "$vm" ]; then
+    discord_vm_connect "$vm" || die "Не удалось подключить Discord к Linux zapret."
+    nohup "$app/Contents/MacOS/Discord" \
+      --proxy-server="socks5://127.0.0.1:$DISCORD_VM_PROXY_PORT" \
+      --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1" >/dev/null 2>&1 &
+    disown 2>/dev/null
+    ok "Discord запущен через Linux VM с zapret/nfqws."
+    say "   TCP идёт через VM. Голосовой UDP остаётся прямым; для звонков включи VPN."
+  elif [ "$(cfg MODE transparent)" = socks ]; then
     ALL_PROXY="socks5h://127.0.0.1:$SOCKS_PORT" all_proxy="socks5h://127.0.0.1:$SOCKS_PORT" \
     HTTPS_PROXY="socks5h://127.0.0.1:$SOCKS_PORT" https_proxy="socks5h://127.0.0.1:$SOCKS_PORT" \
       nohup "$app/Contents/MacOS/Discord" --proxy-server="socks5://127.0.0.1:$SOCKS_PORT" >/dev/null 2>&1 &
@@ -1166,13 +1224,14 @@ cmd_autolist() {
 }
 
 cmd_settings() {
-  local c
+  local c vm
   while true; do
     say ""
     say "  1  Глушить QUIC к Google, чтобы браузер сразу шёл через обход: $([ "$(cfg QUIC 1)" = 1 ] && echo "${G}вкл${N}" || echo выкл)"
     say "  2  Сторож сам подбирает стратегии, если YouTube/Discord отвалились: $([ "$(cfg AUTOFIX 1)" = 1 ] && echo "${G}вкл${N}" || echo выкл)"
     say "  3  Режим: $(mode_name) — переключить на $([ "$(cfg MODE transparent)" = socks ] && echo прозрачный || echo SOCKS-прокси)"
     say "  4  Автосписок (tpws сам добавляет сайты, где заметил блокировку): $([ "$(cfg AUTOLIST 0)" = 1 ] && echo "${G}вкл${N}" || echo выкл)"
+    say "  5  Linux VM для Discord через nfqws: $(cfg NFQWS_VM выкл)"
     say "  0  Назад"
     printf '\nВыбор: '
     read -r c || return 0
@@ -1184,6 +1243,13 @@ cmd_settings() {
          if [ -f "$PL_TPWS" ]; then cmd_start; else ok "Режим: $(mode_name) — заработает при включении"; fi ;;
       4) if [ "$(cfg AUTOLIST 0)" = 1 ]; then cfg_set AUTOLIST 0; else cfg_set AUTOLIST 1; fi
          if [ -f "$PL_TPWS" ]; then tpws_apply "$(cfg MODE transparent)" && ok "tpws перезапущен"; fi ;;
+      5) printf 'SSH-цель VM (user@IP, пусто отключает): '
+         read -r vm || return 0
+         case $vm in
+           '') cfg_set NFQWS_VM ""; ok "Discord снова запускается обычным способом" ;;
+           -*|*[!A-Za-z0-9._@-]*) err "Укажи цель вида user@192.168.1.50, без порта. Для нестандартного порта создай SSH-алиас." ;;
+           *) cfg_set NFQWS_VM "$vm" && ok "Для Discord сохранена Linux VM: $vm" ;;
+         esac ;;
       *) return 0 ;;
     esac
   done
@@ -1385,7 +1451,7 @@ sel_poll() {
   if [ "$sy" -lt "$NY" ] || [ "$sd" -lt "$ND" ]; then
     log "Полностью рабочих стратегий нет: YouTube $sy/$NY, Discord $sd/$ND"
     if [ "$FAIL_NOTIFIED" != 1 ]; then
-      notify "YouTube или Discord не открываются даже через обход — включи VPN"
+      notify "YouTube или Discord не открываются — проверь стратегию, Linux nfqws VM или VPN"
       FAIL_NOTIFIED=1
     fi
     NEXT_CHECK=$(( SECONDS + BACKOFF ))
@@ -1422,8 +1488,8 @@ health_tick() {
   # обрыв на 16 КБ стратегией не лечится — сообщаем один раз и подбор из-за него не запускаем
   if [ -n "$LAST_CUT" ]; then
     if [ "$CUT_NOTIFIED" != 1 ]; then
-      log "Обрыв после 16 КБ: $LAST_CUT — провайдер режет Cloudflare без видимого имени сайта, нужен VPN"
-      notify "Discord на этом провайдере режется после 16 КБ — для Discord включи VPN"
+      log "Обрыв после 16 КБ: $LAST_CUT — провайдер режет Cloudflare без видимого имени сайта; нужен nfqws, роутер или VPN"
+      notify "Discord режется после 16 КБ — настрой Linux nfqws VM или включи VPN"
       CUT_NOTIFIED=1
     fi
   else
@@ -1530,12 +1596,13 @@ menu() {
     say "  6  Перезапустить Discord"
     say "  7  Добавить свой сайт в обход"
     say "  8  Автосписок сайтов"
-    say "  9  Настройки: QUIC, автоподбор, режим"
+    say "  9  Настройки: QUIC, автоподбор, режим, Linux VM"
     say " 10  DNS Google/Cloudflare: вкл/выкл"
     say " 11  Подробный статус и журнал"
     say " 12  Перебрать все стратегии (полный тест)"
     say " 13  Обновить tpws и списки"
     say " 14  Удалить всё"
+    say " 15  Отключить SSH-туннель Linux VM"
     say "  0  Выход"
     printf '\nВыбор: '
     read -r c || exit 0
@@ -1554,13 +1621,14 @@ menu() {
       12) as_root test all; pause ;;
       13) as_root update; pause ;;
       14) as_root uninstall; [ -d "$DIR" ] || exit 0; pause ;;
+      15) cmd_discord_vm_stop; pause ;;
       0|q|Q) exit 0 ;;
     esac
   done
 }
 
 usage() {
-  say "Использование: bash $0 [auto|start|stop|restart|test [all]|check|status|discord|add|dns|update|uninstall]"
+  say "Использование: bash $0 [auto|start|stop|restart|test [all]|check|status|discord|discord-vm-stop|add|dns|update|uninstall]"
 }
 
 # для тестов: ZM_LIB=1 . zapret-mac.sh — подключить функции, ничего не запуская
@@ -1568,7 +1636,7 @@ usage() {
 
 if [ "$(id -u)" -eq 0 ]; then
   case "${1:-}" in
-    ""|menu|discord) die "Меню и Discord запускай без sudo: bash $0 — пароль скрипт спросит сам." ;;
+    ""|menu|discord|discord-vm-stop) die "Меню и Discord запускай без sudo: bash $0 — пароль скрипт спросит сам." ;;
     install)   cmd_install ;;
     auto)      cmd_auto ;;
     start)     cmd_start ;;
@@ -1591,6 +1659,7 @@ else
   case "${1:-}" in
     ""|menu)        user_bootstrap; menu ;;
     discord)        cmd_discord ;;
+    discord-vm-stop) user_bootstrap; cmd_discord_vm_stop ;;
     daemon)         die "Сторож запускается только из launchd." ;;
     help|-h|--help) usage ;;
     *)              user_bootstrap; as_root "$@" ;;

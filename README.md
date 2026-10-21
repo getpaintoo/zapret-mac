@@ -16,7 +16,7 @@
 
 ---
 
-На Windows есть готовая сборка [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube). На macOS она не запускается: winws и драйвер WinDivert существуют только для Windows. Из zapret на macOS работает tpws, и zapret-mac собирает вокруг него всё остальное: прозрачное перенаправление через pf, подбор стратегий, автозапуск и сторожа, который уступает дорогу VPN.
+На Windows есть готовая сборка [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube). WinDivert не запускается на macOS, а локальный tpws не отправляет поддельные пакеты. Для провайдеров, которые обрывают Discord на 16 КБ, можно дополнительно запустить Linux VM в режиме Bridged с обычным zapret/nfqws и подключить Discord через SSH SOCKS-туннель.
 
 ## Возможности
 
@@ -28,6 +28,7 @@
 - **QUIC к Google блокируется.** Браузер сразу идёт по TCP, то есть через обход. Адреса Google Cloud не трогаются: на них бывают VPN-серверы.
 - **Безопасные отказы.** Если якорь pf внутри `com.apple` не срабатывает, скрипт прописывает свой в `/etc/pf.conf`, как установщик zapret. Если прозрачный режим не работает совсем, переходит на SOCKS-прокси. Если tpws упал, перенаправление снимается, чтобы не пропал интернет.
 - **Проверенный tpws.** Скачивается из релиза bol-van/zapret, контрольная сумма SHA-256 сверяется с зашитой в скрипт.
+- **Linux nfqws для Discord.** В настройках можно указать Linux VM. Только Discord запускается через SSH SOCKS-туннель к её nfqws; остальные приложения и маршруты Mac не меняются. [Инструкция](docs/linux-vm-discord.md).
 
 ## Что работает
 
@@ -35,7 +36,7 @@
 |---|:---:|:---:|
 | YouTube в браузере | ✓ | ✓ |
 | Обновления Discord | ✓ | ✓ |
-| Приложение Discord | зависит от провайдера, [см. ниже](#discord-и-обрыв-на-16-кб) | ✓ |
+| Приложение Discord | зависит от провайдера, [Linux nfqws VM](docs/linux-vm-discord.md) или VPN | ✓ |
 | Звонки в Discord (UDP) | ✗ | ✓ |
 
 tpws работает только с TCP, поэтому голос в Discord через обход не идёт.
@@ -69,6 +70,7 @@ bash zapret-mac.sh
 | 12 | Перебрать все стратегии |
 | 13 | Обновить tpws и списки доменов |
 | 14 | Удалить всё |
+| 15 | Отключить SSH-туннель Linux VM |
 
 Без меню:
 
@@ -80,6 +82,8 @@ bash zapret-mac.sh stop        # выключить
 ```
 
 Также есть `start`, `restart`, `test [all]`, `discord`, `add`, `dns`, `update`, `uninstall`.
+
+Параметры Linux VM для Discord задаются в **9 → 5**. После настройки VM используй пункт **6** для запуска Discord через nfqws.
 
 ## Как это работает
 
@@ -106,7 +110,7 @@ bash zapret-mac.sh stop        # выключить
 1. блокирует соединение, если в начале TLS видно имя `discord.com`;
 2. обрывает после ~16 КБ любое соединение с адресами Cloudflare, в котором имя прочитать не смог.
 
-tpws обходит первое правило тем, что прячет имя, и этим включает второе. Приложение Discord живёт на Cloudflare, поэтому грузится обрывками. Обновления Discord это не задевает: они качаются с Google Cloud. YouTube тоже.
+tpws обходит первое правило тем, что прячет имя, и этим включает второе. Приложение Discord живёт на Cloudflare, поэтому грузится обрывками. Обновления Discord это не задевает: они качаются с Google Cloud. YouTube тоже. Для этого случая можно пустить только TCP Discord через Linux VM с nfqws по [этой инструкции](docs/linux-vm-discord.md); TUN VPN остаётся вторым вариантом.
 
 Как это было проверено и что с этим делать: [docs/discord-16kb.md](docs/discord-16kb.md). zapret-mac распознаёт такой обрыв: в проверке он показан как `! Discord — оборвалось на 12 КБ`, и сторож не тратит время на бесполезный подбор стратегий.
 
@@ -162,10 +166,10 @@ sudo pfctl -a zapret-mac/zapret-mac -F all
 <details>
 <summary><b>English</b></summary>
 
-zapret-mac brings [zapret](https://github.com/bol-van/zapret) DPI circumvention for YouTube and Discord to macOS. It runs tpws as a transparent proxy behind pf (the only zapret component that works on macOS), picks separate strategies for YouTube and Discord, starts on boot via launchd, and a watchdog turns the redirection off while a TUN VPN is up and back on when it goes down.
+zapret-mac brings [zapret](https://github.com/bol-van/zapret) DPI circumvention for YouTube and Discord to macOS. It runs tpws as a transparent proxy behind pf, picks separate strategies for YouTube and Discord, starts on boot via launchd, and can optionally launch Discord through a bridged Linux VM running zapret/nfqws.
 
 Install: `curl -fLO https://raw.githubusercontent.com/getpaintoo/zapret-mac/main/zapret-mac.sh && bash zapret-mac.sh`, then choose 1 in the menu.
 
-Known limitation: some ISPs cut any connection to Cloudflare after ~16 KB when they cannot read the SNI, which is exactly what tpws hides. The Discord app is hosted on Cloudflare, so on those ISPs it needs a VPN; Discord updates (Google Cloud) and YouTube work through zapret. See [docs/discord-16kb.md](docs/discord-16kb.md) (in Russian).
+Known limitation: some ISPs cut connections to Cloudflare after ~16 KB when they cannot read the SNI, which is exactly what tpws hides. For those networks, use the optional Linux nfqws VM or a TUN VPN. Discord calls still require a path that carries UDP. See [docs/discord-16kb.md](docs/discord-16kb.md) (in Russian).
 
 </details>
