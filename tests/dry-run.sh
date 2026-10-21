@@ -1,9 +1,10 @@
 #!/bin/bash
 # Проверяет, что tpws принимает все стратегии zapret-mac: основной процесс
 # в обоих режимах (с автосписком и без) и временный процесс для подбора.
-# Работает без root и ничего в системе не меняет.
+# Если указан utunws — что он принимает параметры для Discord (поддельные
+# пакеты должны лежать рядом с ним). Работает без root и ничего в системе не меняет.
 #
-#   ZM_TPWS=/путь/к/tpws bash tests/dry-run.sh
+#   ZM_TPWS=/путь/к/tpws [ZM_UTUNWS=/путь/к/utunws] bash tests/dry-run.sh
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 [ -x "${ZM_TPWS:-}" ] || { echo "Укажи tpws: ZM_TPWS=/путь/к/tpws bash $0" >&2; exit 2; }
@@ -43,6 +44,19 @@ for s in $(seq 1 "$NSTRAT") cur; do
   runs=$(( runs + 1 ))
   dry || { echo "FAIL: tpws для подбора, стратегия $s"; fails=$(( fails + 1 )); }
 done
+
+if [ -x "${ZM_UTUNWS:-}" ]; then
+  build_ut_args
+  A=()
+  for a in "${UT_ARGS[@]}"; do case $a in --user=*) ;; *) A+=("$a") ;; esac; done
+  runs=$(( runs + 1 ))
+  if ! out=$("$UTUNWS" "${A[@]}" --dry-run 2>&1); then
+    printf '%s\n' "$out" | tail -n 2
+    echo "FAIL: utunws для Discord"; fails=$(( fails + 1 ))
+  fi
+else
+  echo "utunws не указан (ZM_UTUNWS) — его параметры не проверены"
+fi
 
 echo "Проверено наборов параметров: $runs, ошибок: $fails"
 [ "$fails" -eq 0 ]

@@ -2,6 +2,19 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
+## [2.2] — 2026-10-21
+
+### Добавлено
+- Второй движок для Discord — utunws из [Flowseal/zapret-mac-discord-youtube](https://github.com/Flowseal/zapret-mac-discord-youtube): nfqws, который получает пакеты через `utun` и отправляет через BPF. Стратегия `simple-fake`: поддельный ClientHello с `www.google.com` перед настоящим. Приложение Discord открывается целиком у провайдеров с обрывом Cloudflare на 16 КБ, голос по UDP идёт через обход.
+- LaunchDaemon `com.zapret-mac.utunws`, настройка «Discord через utunws» (пункт 9 → 5, `UTUNWS=1`).
+- «Проверить» при включённом VPN показывает и Discord через utunws.
+- utunws и поддельные пакеты скачиваются из релиза Flowseal, SHA-256 сверяется; `update` его переустанавливает при смене версии.
+
+### Изменено
+- Правила pf: адреса Discord (`162.159.128.0/21`, `162.159.136.0/22`) и порты голоса уходят в utunws, QUIC и IPv6 к Discord получают отказ.
+- Сторож перезапускает utunws при смене сети и снимает его правила, если utunws не отвечает.
+- `tests/dry-run.sh` и CI проверяют параметры utunws.
+
 ## [2.1] — 2026-10-21
 
 ### Добавлено
@@ -33,4 +46,5 @@
 
 - tpws как SOCKS-прокси на `127.0.0.1:1080` с системным прокси macOS, одна стратегия на все сайты, LaunchAgent пользователя.
 
+[2.2]: https://github.com/getpaintoo/zapret-mac/releases/tag/v2.2
 [2.1]: https://github.com/getpaintoo/zapret-mac/releases/tag/v2.1
