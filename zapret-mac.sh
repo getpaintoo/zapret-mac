@@ -43,6 +43,7 @@ SOCKS_PORT=1080      # tpws в режиме SOCKS-прокси
 TEST_PORT=1090       # временный tpws для подбора стратегий
 LBL_TPWS="com.zapret-mac.tpws"
 LBL_WD="com.zapret-mac.watchdog"
+LBL_DS="com.zapret-mac.discord"   # LaunchAgent автозапуска Discord, лежит у пользователя
 PL_TPWS="/Library/LaunchDaemons/$LBL_TPWS.plist"
 PL_WD="/Library/LaunchDaemons/$LBL_WD.plist"
 CHECK_EVERY=1800     # как часто сторож проверяет YouTube и Discord, секунд
@@ -1107,31 +1108,129 @@ cmd_status() {
   warn_other_proxies
 }
 
-cmd_discord() {   # от имени пользователя
-  local app="" p i
+discord_app() {   # ищет Discord.app → DS_APP
+  local p
+  DS_APP=""
   for p in "/Applications/Discord.app" "$HOME/Applications/Discord.app"; do
-    [ -d "$p" ] && { app=$p; break; }
+    [ -d "$p" ] && { DS_APP=$p; return 0; }
   done
-  [ -n "$app" ] || die "Discord не найден в «Программах»."
-  [ -f "$PL_TPWS" ] || die "Сначала включи обход (пункт 1 или 2)."
-  if pgrep -x Discord >/dev/null 2>&1; then
-    osascript -e 'tell application "Discord" to quit' >/dev/null 2>&1
-    for (( i=0; i<30; i++ )); do pgrep -x Discord >/dev/null 2>&1 || break; sleep 0.3; done
-    pkill -x Discord >/dev/null 2>&1
-    sleep 1
-  fi
+  return 1
+}
+
+ds_running() { pgrep -x -U "$(id -u)" Discord >/dev/null 2>&1; }
+
+# открывает Discord так, как нужно в текущем режиме: в SOCKS — с прокси обхода
+discord_launch() {
   if [ "$(cfg MODE transparent)" = socks ]; then
     ALL_PROXY="socks5h://127.0.0.1:$SOCKS_PORT" all_proxy="socks5h://127.0.0.1:$SOCKS_PORT" \
     HTTPS_PROXY="socks5h://127.0.0.1:$SOCKS_PORT" https_proxy="socks5h://127.0.0.1:$SOCKS_PORT" \
-      nohup "$app/Contents/MacOS/Discord" --proxy-server="socks5://127.0.0.1:$SOCKS_PORT" >/dev/null 2>&1 &
+      nohup "$DS_APP/Contents/MacOS/Discord" --proxy-server="socks5://127.0.0.1:$SOCKS_PORT" >/dev/null 2>&1 &
     disown 2>/dev/null
+  else
+    open -a "$DS_APP"
+  fi
+}
+
+cmd_discord() {   # от имени пользователя
+  local i
+  discord_app || die "Discord не найден в «Программах»."
+  [ -f "$PL_TPWS" ] || die "Сначала включи обход (пункт 1 или 2)."
+  if ds_running; then
+    osascript -e 'tell application "Discord" to quit' >/dev/null 2>&1
+    for (( i=0; i<30; i++ )); do ds_running || break; sleep 0.3; done
+    pkill -x Discord >/dev/null 2>&1
+    sleep 1
+  fi
+  discord_launch
+  if [ "$(cfg MODE transparent)" = socks ]; then
     ok "Discord перезапущен через SOCKS-прокси обхода."
     say "   Апдейтер Discord прокси не слушает — если висит «Checking for updates», верни прозрачный режим (пункт 9)."
   else
-    open -a "$app"
     ok "Discord перезапущен."
     say "   В прозрачном режиме обход видит и апдейтер — «Checking for updates» проходит за несколько секунд."
   fi
+}
+
+# состояние, которое пишет сторож (direct|vpn|down|off) → WD_ST. После перезагрузки
+# в файле может остаться старое, поэтому верим ему, только если он записан после загрузки
+wd_read_state() {
+  local boot m
+  WD_ST=""
+  [ -f "$RUN/status" ] || return 1
+  boot=$(sysctl -n kern.boottime 2>/dev/null | awk -F'[ ,]+' '{print $4}')
+  m=$(stat -f %m "$RUN/status" 2>/dev/null)
+  case "$boot$m" in ''|*[!0-9]*) ;; *) [ "$m" -ge "$boot" ] || return 1 ;; esac
+  read -r WD_ST _ < "$RUN/status"
+  [ -n "$WD_ST" ]
+}
+
+# ждёт до $1 секунд, пока поднимется обход. Если включён VPN, ждать нечего
+ds_wait_ready() {
+  local i
+  for (( i=0; i<$1; i++ )); do
+    if wd_read_state; then
+      case $WD_ST in
+        vpn) return 0 ;;
+        direct) { [ "$(cfg MODE transparent)" != socks ] || port_listening "$SOCKS_PORT"; } && return 0 ;;
+      esac
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# вызывается из LaunchAgent при входе в систему
+cmd_discord_auto() {
+  discord_app || exit 0
+  ds_running && exit 0                                        # уже открыт — не трогаем
+  if [ ! -f "$PL_TPWS" ]; then open -a "$DS_APP"; exit 0; fi  # обход выключен — обычный запуск
+  ds_wait_ready 120 || say "$(date '+%d.%m %H:%M:%S') обход не поднялся за 2 минуты, открываю Discord как есть"
+  ds_running && exit 0                                        # пока ждали, его открыли руками
+  discord_launch
+}
+
+ds_agent() { printf '%s/Library/LaunchAgents/%s.plist' "$RHOME" "$LBL_DS"; }
+ds_autostart_state() { if [ -f "$(ds_agent)" ]; then printf '%sвкл%s' "$G" "$N"; else printf 'выкл'; fi; }
+
+cmd_ds_autostart() {   # от имени пользователя: включает и выключает автозапуск
+  local pl logf
+  [ -n "$RHOME" ] || die "Не нашёл домашнюю папку пользователя."
+  pl=$(ds_agent)
+  if [ -f "$pl" ]; then
+    launchctl bootout "gui/$(id -u)/$LBL_DS" >/dev/null 2>&1
+    rm -f "$pl"
+    ok "Автозапуск Discord выключен."
+    return 0
+  fi
+  [ -f "$SELF" ] || die "Сначала установи zapret-mac (пункт 1)."
+  discord_app || die "Discord не найден в «Программах»."
+  logf="$RHOME/Library/Logs/zapret-mac-discord.log"
+  mkdir -p "${pl%/*}" "${logf%/*}"
+  # AbandonProcessGroup — чтобы launchd не убил Discord, запущенный в режиме SOCKS, вместе со скриптом
+  cat > "$pl" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LBL_DS</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(xml "$SELF")</string>
+    <string>discord-auto</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>$(xml "$logf")</string>
+  <key>StandardErrorPath</key><string>$(xml "$logf")</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$pl" >/dev/null 2>&1 || { rm -f "$pl"; die "Не получилось записать $pl"; }
+  ok "Discord будет открываться сам при входе в систему, когда поднимется обход."
+  say "   Если Discord есть в «Системные настройки → Основные → Объекты входа», убери его оттуда:"
+  say "   иначе он стартует раньше обхода, а в режиме SOCKS — мимо прокси."
 }
 
 cmd_add() {
@@ -1249,6 +1348,10 @@ cmd_uninstall() {
   migrate_v1 >/dev/null 2>&1
   rm -rf "$DIR"
   rm -f "$PL_TPWS" "$PL_WD"
+  if [ -n "$RHOME" ] && [ -f "$(ds_agent)" ]; then
+    launchctl bootout "gui/$(id -u "$RUSER")/$LBL_DS" >/dev/null 2>&1
+    rm -f "$(ds_agent)"
+  fi
   [ -n "$SHORTCUT" ] && grep -qF "$SELF" "$SHORTCUT" 2>/dev/null && rm -f "$SHORTCUT"
   ok "zapret-mac удалён. Сеть вернулась к обычным настройкам."
 }
@@ -1536,6 +1639,7 @@ menu() {
     say " 12  Перебрать все стратегии (полный тест)"
     say " 13  Обновить tpws и списки"
     say " 14  Удалить всё"
+    say " 15  Открывать Discord при входе: $(ds_autostart_state)"
     say "  0  Выход"
     printf '\nВыбор: '
     read -r c || exit 0
@@ -1554,13 +1658,14 @@ menu() {
       12) as_root test all; pause ;;
       13) as_root update; pause ;;
       14) as_root uninstall; [ -d "$DIR" ] || exit 0; pause ;;
+      15) ( cmd_ds_autostart ); pause ;;
       0|q|Q) exit 0 ;;
     esac
   done
 }
 
 usage() {
-  say "Использование: bash $0 [auto|start|stop|restart|test [all]|check|status|discord|add|dns|update|uninstall]"
+  say "Использование: bash $0 [auto|start|stop|restart|test [all]|check|status|discord|autostart|add|dns|update|uninstall]"
 }
 
 # для тестов: ZM_LIB=1 . zapret-mac.sh — подключить функции, ничего не запуская
@@ -1568,7 +1673,7 @@ usage() {
 
 if [ "$(id -u)" -eq 0 ]; then
   case "${1:-}" in
-    ""|menu|discord) die "Меню и Discord запускай без sudo: bash $0 — пароль скрипт спросит сам." ;;
+    ""|menu|discord|discord-auto|autostart) die "Меню и Discord запускай без sudo: bash $0 — пароль скрипт спросит сам." ;;
     install)   cmd_install ;;
     auto)      cmd_auto ;;
     start)     cmd_start ;;
@@ -1591,6 +1696,8 @@ else
   case "${1:-}" in
     ""|menu)        user_bootstrap; menu ;;
     discord)        cmd_discord ;;
+    discord-auto)   cmd_discord_auto ;;
+    autostart)      cmd_ds_autostart ;;
     daemon)         die "Сторож запускается только из launchd." ;;
     help|-h|--help) usage ;;
     *)              user_bootstrap; as_root "$@" ;;
