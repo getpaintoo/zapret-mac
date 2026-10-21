@@ -25,7 +25,7 @@
 
 ## utunws
 
-utunws — nfqws из zapret v72.13 с macOS-входом и выходом из [Flowseal/zapret-mac-discord-youtube](https://github.com/Flowseal/zapret-mac-discord-youtube). Скрипт скачивает релиз Flowseal (`UTUNWS_TAG`) и сверяет SHA-256 трёх файлов: `utunws`, `tls_clienthello_www_google_com.bin`, `ACTIVE_DISCORD_UDP.bin`.
+utunws — nfqws из zapret v72.13 с macOS-входом и выходом из [Flowseal/zapret-mac-discord-youtube](https://github.com/Flowseal/zapret-mac-discord-youtube). Скрипт скачивает релиз Flowseal (`UTUNWS_TAG`) и сверяет SHA-256 четырёх файлов: `utunws`, `tls_clienthello_www_google_com.bin`, `tls_clienthello_4pda_to.bin`, `ACTIVE_DISCORD_UDP.bin`.
 
 `zapret-mac.sh utunws-run`:
 
@@ -34,17 +34,33 @@ utunws — nfqws из zapret v72.13 с macOS-входом и выходом из
 3. назначает `utun50` адреса `10.77.0.1 → 10.77.0.2`;
 4. записывает интерфейс, шлюз и MAC в `/opt/zapret-mac/run/utunws.net` и ждёт, пока utunws работает. Упал — выходит, launchd запускает снова.
 
-Профили (стратегия `simple-fake` Flowseal):
+### Профили
 
-```
---filter-tcp=443,2053,2083,2087,2096,8443 --dpi-desync=fake --dpi-desync-repeats=6
-  --dpi-desync-fooling=ts --dpi-desync-fake-tls=tls_clienthello_www_google_com.bin
---new
---filter-udp=19294-19344,50000-50100 --filter-l7=discord,stun --dpi-desync=fake
-  --dpi-desync-repeats=6 --dpi-desync-fake-discord=… --dpi-desync-fake-stun=ACTIVE_DISCORD_UDP.bin
-```
+Каждый профиль привязан к адресам через `--ipset-ip`:
 
-Списков доменов нет намеренно. macOS отдаёт пакеты в `utun` не по порядку и с перекрытием, и utunws отправляет их так же. Если соединение прошло через utunws без подделки, провайдер не может прочитать имя сайта и режет его после 16 КБ (проверено на `speed.cloudflare.com`). Поэтому pf отдаёт utunws только адреса Discord, а utunws подделывает всё, что пришло.
+1. **Discord** — TCP 443, 2053, 2083, 2087, 2096, 8443 к адресам Discord (`<zm_ds4>`), стратегия из настройки `UT_D`:
+
+   | № | Название | Параметры (Flowseal) |
+   |---|---|---|
+   | 1 | SEQOVL | `--dpi-desync=multisplit --dpi-desync-split-seqovl=568 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern=tls_clienthello_4pda_to.bin` |
+   | 2 | FAKE | `--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fake-tls=tls_clienthello_www_google_com.bin` |
+   | 3 | FAKESEQOVL | `--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-fooling=badseq …` |
+
+2. **YouTube** — только если `YT=utunws`: TCP 443 к адресам Google (`<zm_g4>`), `--ip-id=zero --dpi-desync=hostfakesplit --dpi-desync-fooling=ts --dpi-desync-hostfakesplit-mod=host=www.google.com`.
+3. **Голос** — UDP 19294–19344 и 50000–50100, `--filter-l7=discord,stun --dpi-desync=fake` с `ACTIVE_DISCORD_UDP.bin`.
+
+Пропускать через utunws что-то без обработки нельзя. macOS отдаёт пакеты в `utun` не по порядку и с перекрытием, utunws отправляет их так же, и провайдер, не прочитав имя сайта, может оборвать соединение. Поэтому pf отдаёт utunws только адреса Discord (и Google, если через него идёт YouTube), а профили обрабатывают всё, что пришло.
+
+### Замеры
+
+Октябрь 2026 года, macOS 26.4. Проверялись главная `discord.com`, JS-файл приложения Discord (1,5–12 МБ), YouTube и `i.ytimg.com`.
+
+| Стратегия | Домашний провайдер | МегаФон, раздача с iPhone |
+|---|---|---|
+| tpws, 16 стратегий, YouTube | открывается | почти везде 0 из 3 |
+| utunws `FAKE` | Discord открывается | Discord не открывается |
+| utunws `SEQOVL` | Discord открывается | Discord открывается |
+| utunws `hostfakesplit`, YouTube | — | YouTube открывается |
 
 utunws работает только в прозрачном режиме. Без него (`UTUNWS=0`, не скачался, не поднялся) Discord идёт через tpws, как в 2.1.
 
@@ -70,7 +86,16 @@ block return out quick on en0 inet proto udp from any to <zm_ds4> port 443 user 
 block return out quick on en0 inet6 proto { tcp, udp } from any to <zm_ds6> user { >root }
 ```
 
-- `<zm_ds4>` — адреса Discord на Cloudflare: `162.159.128.0/21` и `162.159.136.0/22` (`discord.com`, `gateway.discord.gg`, `cdn.discordapp.com`, `media.discordapp.net`, `discord.media`).
+Если YouTube тоже идёт через utunws (`YT=utunws`), добавляются ещё:
+
+```
+pass out quick on en0 route-to (utun50 10.77.0.2) inet proto tcp from any to <zm_g4> port 443 user { >root } no state
+block return out quick on en0 inet proto udp from any to <zm_g4> port 443 user { >root }
+block return out quick on en0 inet6 proto { tcp, udp } from any to <zm_g6> port 443 user { >root }
+```
+
+- `<zm_ds4>` — адреса Discord: на Cloudflare `162.159.128.0/21` и `162.159.136.0/22` (`discord.com`, `gateway.discord.gg`, `cdn.discordapp.com`, `media.discordapp.net`, `discord.media`) и сервер обновлений `stable.dl2.discordapp.net` в Google Cloud.
+- `<zm_g4>`, `<zm_g6>` — сервисы Google без Google Cloud, та же таблица, что для QUIC.
 - Первое правило нужно потому, что пакет, отправленный через `route-to` в другой интерфейс, pf проверяет ещё раз уже на нём, и без него пакет перехватило бы правило tpws, у которого нет привязки к интерфейсу.
 - QUIC к Discord и Discord по IPv6 сразу получают отказ, и приложение уходит на TCP по IPv4 — то есть в utunws.
 - Пакеты, которые utunws пишет через BPF, через pf не проходят.
@@ -101,11 +126,10 @@ VPN-клиент в режиме системного прокси (без TUN) 
 
 Проверка YouTube и Discord идёт через 8 секунд после перехода в `direct`, после смены сети и потом раз в 30 минут. Сторож качает сжатые страницы, чтобы не тратить лишний трафик. Если два раза подряд что-то не открылось, он запускает подбор в фоне:
 
-1. сначала проверяет текущие стратегии через отдельный tpws — если они рабочие, значит, сломалось перенаправление, и сторож перезапускает tpws и pf;
+1. сначала проверяет текущие стратегии через отдельные tpws и utunws — если они рабочие, значит, сломалось перенаправление, и сторож перезапускает tpws, utunws и pf;
 2. иначе перебирает все стратегии и оставляет лучшие для YouTube и для Discord;
 3. если полностью рабочих нет, присылает уведомление и откладывает следующий подбор: 30 минут, час, два и так далее до 4 часов.
 
-Обрыв на 16 КБ ([discord-16kb.md](discord-16kb.md)) подбор не запускает.
 
 ## Подбор стратегий
 
@@ -119,7 +143,22 @@ pass out quick on utunN route-to (en0 <шлюз>) inet proto tcp from <адре�
 
 выпускает такие пакеты прямо в Wi‑Fi мимо туннеля. Обычные программы шлют с адреса VPN, и правило их не задевает. Перед подбором скрипт сравнивает внешний IP через временный tpws и через `curl --interface en0`: если они не совпали, подбор отменяется с просьбой выключить VPN.
 
-utunws подбор не проходит: у него одна стратегия. Но «Проверить» при включённом VPN показывает и его: в якорь `zapret-mac-test` добавляются правила utunws, а curl открывает адреса Discord от имени пользователя через `--interface en0`, мимо туннеля.
+Стратегии utunws проверяет временный utunws на `utun51` (`ZAPRET_UTUN_UNIT=52`, адреса `10.77.1.1 → 10.77.1.2`), рабочий на `utun50` при этом не трогается. curl открывает адреса от root через `--interface en0`. Правила основного якоря трафик root не трогают, а правила в `zapret-mac-test` отдают его временному utunws:
+
+```
+pass out quick on utun51 all no state
+pass out quick on en0 route-to (utun51 10.77.1.2) inet proto tcp from any to <zm_t4> port { 443, … } user root no state
+```
+
+Порядок подбора с utunws:
+
+1. стратегии tpws — только для YouTube;
+2. стратегии utunws для Discord, по порядку, пока одна не откроет всё;
+3. если tpws открывает YouTube не полностью — YouTube через utunws с лучшей стратегией для Discord. Открывает больше — YouTube переходит на utunws (`YT=utunws`).
+
+Без utunws обе группы подбираются через tpws, как раньше.
+
+«Проверить» при включённом VPN показывает и utunws: в якорь `zapret-mac-test` добавляются правила для рабочего utunws, а curl открывает адреса от имени пользователя через `--interface en0`, мимо туннеля.
 
 ## Настройки
 
@@ -134,4 +173,6 @@ utunws подбор не проходит: у него одна стратеги
 | `AUTOLIST` | `0` | профиль автосписка tpws |
 | `PF_ROOT` | `com.apple` | `com.apple` или `zapret-mac` — куда подключены правила pf |
 | `UTUNWS` | `1` | Discord через utunws |
+| `UT_D` | `1` | стратегия utunws для Discord |
+| `YT` | `tpws` | `tpws` или `utunws` — чем обходить YouTube |
 | `TP_OK` | — | `1`, когда прозрачный режим проверен на этом Mac |
