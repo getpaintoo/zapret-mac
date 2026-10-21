@@ -10,7 +10,7 @@
 ![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon%20%7C%20Intel-black?logo=apple)
 ![bash](https://img.shields.io/badge/bash-3.2-4EAA25?logo=gnubash&logoColor=white)
 
-[Установка](#установка) · [Как это работает](#как-это-работает) · [Discord и обрыв на 16 КБ](#discord-и-обрыв-на-16-кб) · [Если пропал интернет](#если-пропал-интернет)
+[Установка](#установка) · [Как это работает](#как-это-работает) · [Как обходится блокировка Discord](#как-обходится-блокировка-discord) · [Если пропал интернет](#если-пропал-интернет)
 
 </div>
 
@@ -18,7 +18,7 @@
 
 На Windows есть готовая сборка [Flowseal/zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube). На macOS она не запускается: winws и драйвер WinDivert существуют только для Windows. zapret-mac берёт два движка, которые на macOS работают: tpws из zapret для YouTube и utunws из [macOS-порта Flowseal](https://github.com/Flowseal/zapret-mac-discord-youtube) для Discord. Вокруг них — прозрачное перенаправление через pf, подбор стратегий, автозапуск и сторож, который уступает дорогу VPN.
 
-> **Новое в 2.2:** Discord работает без VPN целиком — приложение, чаты и звонки — даже у провайдеров, которые режут Cloudflare после 16 КБ. Подробности — в [CHANGELOG.md](CHANGELOG.md).
+> **Новое в 2.2:** Discord работает без VPN целиком — приложение, чаты и звонки. Подробности — в [CHANGELOG.md](CHANGELOG.md).
 
 ## Возможности
 
@@ -41,9 +41,7 @@
 | Приложение Discord | ✓ через utunws | ✓ |
 | Звонки в Discord (UDP) | ✓ через utunws | ✓ |
 
-Проверено с выключенным VPN у провайдера, который блокирует `discord.com` по имени и режет Cloudflare после 16 КБ: приложение Discord, чаты и звонки работают. Если у твоего провайдера звонок не подключается, напиши в [Issues](https://github.com/getpaintoo/zapret-mac/issues), а на время звонка включи VPN.
-
-Без utunws (он выключен или не скачался) Discord идёт через tpws. Тогда у провайдеров с [обрывом на 16 КБ](#discord-и-обрыв-на-16-кб) приложению нужен VPN, а звонки через обход не работают: tpws умеет только TCP.
+Проверено с выключенным VPN: приложение Discord, чаты и звонки работают. Если у твоего провайдера что-то не открывается, напиши в [Issues](https://github.com/getpaintoo/zapret-mac/issues).
 
 ## Установка
 
@@ -108,16 +106,16 @@ bash zapret-mac.sh stop        # выключить
 
 Подробно: [docs/architecture.md](docs/architecture.md).
 
-## Discord и обрыв на 16 КБ
+## Как обходится блокировка Discord
 
-Часть провайдеров делает против Discord две вещи:
+Провайдеры мешают Discord двумя способами:
 
-1. блокирует соединение, если в начале TLS видно имя `discord.com`;
-2. обрывает после ~16 КБ любое соединение с адресами Cloudflare, в котором имя прочитать не смог.
+1. блокируют соединение, если в начале TLS видно имя `discord.com`;
+2. обрывают после ~16 КБ соединения с адресами Cloudflare, в которых не смогли прочитать имя сайта.
 
-tpws обходит первое правило тем, что прячет имя, и этим включает второе: приложение Discord живёт на Cloudflare и грузится обрывками. utunws имя не прячет, а подменяет: сначала отправляет поддельное приветствие с `www.google.com`, которое сервер выбросит, а провайдер примет за настоящее. Поэтому с utunws Discord открывается целиком.
+utunws перед настоящим TLS-приветствием отправляет поддельное — с именем `www.google.com` и испорченной меткой времени TCP. Провайдер читает разрешённое имя и пропускает соединение, а сервер подделку выбрасывает и получает настоящее приветствие. Ни одно из правил не срабатывает, и Discord открывается целиком. Голос по UDP utunws проводит так же, с поддельным пакетом Discord перед настоящими.
 
-Как это было проверено: [docs/discord-16kb.md](docs/discord-16kb.md). Если обрыв всё же остался, в проверке он показан как `! Discord — оборвалось на 12 КБ`, и сторож не тратит время на бесполезный подбор стратегий.
+Подробно, вместе с правилами pf: [docs/architecture.md](docs/architecture.md#utunws).
 
 ## Если пропал интернет
 
@@ -177,6 +175,6 @@ zapret-mac brings [zapret](https://github.com/bol-van/zapret) DPI circumvention 
 
 Install: `curl -fLO https://raw.githubusercontent.com/getpaintoo/zapret-mac/main/zapret-mac.sh && bash zapret-mac.sh`, then choose 1 in the menu.
 
-Some ISPs cut any connection to Cloudflare after ~16 KB when they cannot read the SNI, which is exactly what tpws hides. utunws sends a fake ClientHello for www.google.com before the real one instead, so the Discord app (hosted on Cloudflare) and voice (UDP) work without a VPN. See [docs/discord-16kb.md](docs/discord-16kb.md) (in Russian).
+Discord goes through utunws: before the real TLS ClientHello it sends a fake one for www.google.com, so the ISP lets the connection through. The Discord app, chats and voice calls work without a VPN. Details: [docs/architecture.md](docs/architecture.md#utunws) (in Russian).
 
 </details>
