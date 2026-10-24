@@ -222,6 +222,7 @@ build_main_args() {
     ARGS=(--user=root "--port=$TP_PORT" --bind-addr=127.0.0.1 --bind-iface6=lo0 --bind-linklocal=force --bind-wait-ip=20)
   fi
   ARGS+=(--maxconn=2048 --maxfiles=20480)
+  [ "$(cfg DEBUG 0)" = 1 ] && ARGS+=(--debug=1)   # подробный журнал каждого соединения — в tpws.log
   hl_set youtube; add_strategy "$(strat_of Y)"
   ARGS+=(--new); hl_set general; add_strategy "$(strat_of D)"
   # автосписок выключен по умолчанию: tpws путает с блокировкой обычные обрывы (ocsp.apple.com
@@ -404,6 +405,7 @@ build_ut_args() {
             --dpi-desync=fake --dpi-desync-repeats=6
             "--dpi-desync-fake-discord=$d/ACTIVE_DISCORD_UDP.bin" "--dpi-desync-fake-stun=$d/ACTIVE_DISCORD_UDP.bin"
             --user=nobody)
+  [ "$(cfg DEBUG 0)" = 1 ] && UT_ARGS+=(--debug=1)   # в utunws.log
 }
 
 # временный SOCKS-tpws для подбора; $1 = номер стратегии или cur (текущие), $2 = адрес для исходящих
@@ -2269,6 +2271,15 @@ cmd_sites_select() {
   return 0
 }
 
+cmd_debug() {   # on|off — подробный журнал tpws и utunws (для разбора, потом выключить)
+  case ${1:-} in on) cfg_set DEBUG 1 ;; off) cfg_set DEBUG 0 ;; *) die "debug on|off" ;; esac
+  if [ -f "$PL_TPWS" ]; then
+    tpws_apply "$(cfg MODE transparent)" || return 1
+    [ -f "$PL_UT" ] && { ut_apply || return 1; fw_loaded && fw_on >/dev/null 2>&1; }
+  fi
+  ok "Подробный журнал tpws и utunws: $([ "$1" = on ] && echo включён || echo выключен)"
+}
+
 cmd_dns_set() {   # on|off
   case ${1:-} in
     on)  [ -f "$DNS_BACKUP" ] && { ok "DNS уже Google/Cloudflare."; return 0; } ;;
@@ -2443,7 +2454,8 @@ cmd_diag() {
   say "utunws: $(pgrep -f "$UTUNWS" | tr '\n' ' ')· $UT_IF: $(ut_up && echo поднят || echo нет)"
   say ""; say "── сайты: от пользователя (как программы) и от root напрямую через $PHYS"
   pu=$(probe_user)
-  for url in "$CONTROL_URL" https://example.com/ https://speedtest.net/ https://www.youtube.com/ https://i.ytimg.com/ https://discord.com/; do
+  # gstatic есть в списке YouTube, но не заблокирован: на нём видно, ломает ли соединения сама нарезка
+  for url in "$CONTROL_URL" https://example.com/ https://www.gstatic.com/generate_204 https://www.youtube.com/ https://i.ytimg.com/ https://discord.com/; do
     for a in apps direct; do
       if [ "$a" = apps ]; then
         t=$(sudo -u "$pu" /usr/bin/curl -s -o /dev/null --noproxy '*' --connect-timeout 5 --max-time 8 -A "$UA" \
@@ -2455,6 +2467,25 @@ cmd_diag() {
       printf '   %-6s %-45s rc=%-3s %s%s\n' "$a" "${url#https://}" "$rc" "$t" "$([ "$rc" != 0 ] && printf ' (%s)' "$(curl_why "$rc")")"
     done
   done
+  # транспорт utunws отдельно от DPI: имя example.com провайдер не режет, а адрес — Discord,
+  # поэтому запрос уходит в utunws. Открылось напрямую, но не через utunws — utunws не отправляет пакеты
+  say ""; say "── utunws: SNI example.com на адрес Discord 162.159.128.233"
+  t=$(/usr/bin/curl -s -k -o /dev/null --noproxy '*' --interface "$PHYS" --connect-timeout 5 --max-time 8 \
+        --connect-to example.com:443:162.159.128.233:443 -w '%{http_code} %{time_total}s' https://example.com/ 2>/dev/null); rc=$?
+  printf '   %-34s rc=%-3s %s\n' "напрямую (root, $PHYS)" "$rc" "$t"
+  if ut_active && fw_loaded; then
+    t=$(sudo -u "$pu" /usr/bin/curl -s -k -o /dev/null --noproxy '*' --connect-timeout 5 --max-time 8 \
+          --connect-to example.com:443:162.159.128.233:443 -w '%{http_code} %{time_total}s' https://example.com/ 2>/dev/null); rc=$?
+    printf '   %-34s rc=%-3s %s\n' "через рабочий utunws ($UT_IF)" "$rc" "$t"
+  fi
+  if ut_files_ok && ! vpn_iface >/dev/null && ut_try_start 1; then
+    for u in example.com discord.com; do
+      t=$(/usr/bin/curl -s -k -o /dev/null --noproxy '*' --interface "$PHYS" --connect-timeout 5 --max-time 8 \
+            --connect-to "$u:443:162.159.128.233:443" -w '%{http_code} %{time_total}s' "https://$u/" 2>/dev/null); rc=$?
+      printf '   %-34s rc=%-3s %s\n' "временный utunws, SNI $u" "$rc" "$t"
+    done
+    ut_try_stop
+  fi
   say "состояния pf к сайтам после проверки:"
   pfctl -ss 2>/dev/null | grep -E "127\.0\.0\.1:$TP_PORT|$UT_PEER" | head -12 | sed 's/^/   /'
   say ""; say "── tpws.log"; tail -n 5 "$LOGS/tpws.log" 2>/dev/null | sed 's/^/   /'
@@ -2916,7 +2947,7 @@ menu() {
 
 usage() {
   say "Использование: bash $0 [auto|start|stop|restart|test [all]|check|status|discord|autostart|add|dns|update|uninstall]"
-  say "Для приложения: on|off|pause МИНУТ|resume|info|check-now|diag|update-strategies|sites on|off|site-add ДОМЕН…|site-del ДОМЕН…|sites-select|dns on|off|uninstall yes|gui-install ПОЛЬЗОВАТЕЛЬ"
+  say "Для приложения: on|off|pause МИНУТ|resume|info|check-now|diag|debug on|off|update-strategies|sites on|off|site-add ДОМЕН…|site-del ДОМЕН…|sites-select|dns on|off|uninstall yes|gui-install ПОЛЬЗОВАТЕЛЬ"
 }
 
 # для тестов: ZM_LIB=1 . zapret-mac.sh — подключить функции, ничего не запуская
@@ -2950,6 +2981,7 @@ if [ "$(id -u)" -eq 0 ]; then
     info)      cmd_info ;;
     check-now) cmd_check_now ;;
     diag)      cmd_diag ;;
+    debug)     cmd_debug "${2:-}" ;;
     update-strategies) cmd_update_strategies "${2:-}" ;;
     sites)     cmd_sites "${2:-}" ;;
     site-add)  shift; cmd_site_add "$@" ;;
