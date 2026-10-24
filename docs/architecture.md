@@ -1,6 +1,8 @@
 # Как устроен zapret-mac
 
-Весь проект — один файл `zapret-mac.sh`. Меню и команда `discord` работают от имени пользователя, всё остальное скрипт перезапускает через `sudo` из установленной копии `/opt/zapret-mac/zapret-mac.sh`. Папка принадлежит root: её запускают системные демоны, и править её может только администратор.
+Обход делает `zapret-mac.sh`, стратегии лежат в `strategies.conf`. Меню и команда `discord` работают от имени пользователя, всё остальное скрипт перезапускает через `sudo` из установленной копии `/opt/zapret-mac/zapret-mac.sh`. Папка принадлежит root: её запускают системные демоны, и править её может только администратор.
+
+Приложение Zapret в строке меню (`app/`) — пульт к этому скрипту: показывает состояние и запускает его команды. Обход от приложения не зависит и работает, даже когда оно закрыто.
 
 ## Компоненты
 
@@ -10,13 +12,14 @@
 | utunws | LaunchDaemon `com.zapret-mac.utunws` (`zapret-mac.sh utunws-run`), после запуска от `nobody` | Discord: получает пакеты из `utun50`, добавляет поддельные, отправляет через BPF |
 | сторож | LaunchDaemon `com.zapret-mac.watchdog` (`zapret-mac.sh daemon`) | следит за VPN и tpws, включает и снимает правила pf, проверяет сайты |
 | правила pf | якорь `com.apple/zapret-mac` или `zapret-mac/zapret-mac` | заворачивают TCP 80/443 в tpws, Discord — в utunws, глушат QUIC к Google и Discord |
+| приложение Zapret | `/Applications/Zapret.app`, от пользователя, вход в систему — через `SMAppService` | значок состояния, панель, команды скрипта через `sudo -n` |
 
 ## Профили tpws
 
 Основной tpws получает два-три профиля, разделённых `--new`:
 
 1. `list-youtube.txt` со стратегией YouTube (`S_Y` в настройках);
-2. `list-general.txt` и `list-user.txt` со стратегией Discord (`S_D`);
+2. `list-general.txt` и `list-user.txt` со стратегией Discord и своих сайтов (`S_D`); `list-user.txt` — только если свои сайты включены (`USER_SITES=1`);
 3. `--hostlist-auto` — только если автосписок включён (`AUTOLIST=1`).
 
 Во всех профилях действуют исключения: `list-exclude.txt` (Flowseal), `list-exclude-mac.txt` (службы Apple) и `list-exclude-user.txt`. Сайты не из списков проходят через tpws без изменений.
@@ -25,7 +28,7 @@
 
 ## utunws
 
-utunws — nfqws из zapret v72.13 с macOS-входом и выходом из [Flowseal/zapret-mac-discord-youtube](https://github.com/Flowseal/zapret-mac-discord-youtube). Скрипт скачивает релиз Flowseal (`UTUNWS_TAG`) и сверяет SHA-256 четырёх файлов: `utunws`, `tls_clienthello_www_google_com.bin`, `tls_clienthello_4pda_to.bin`, `ACTIVE_DISCORD_UDP.bin`.
+utunws — nfqws из zapret v72.13 с macOS-входом и выходом из [Flowseal/zapret-mac-discord-youtube](https://github.com/Flowseal/zapret-mac-discord-youtube). Скрипт скачивает релиз Flowseal (`UTUNWS_TAG`) и сверяет SHA-256 семи файлов: `utunws` и поддельных пакетов `tls_clienthello_www_google_com.bin`, `tls_clienthello_4pda_to.bin`, `tls_clienthello_max_ru.bin`, `stun.bin`, `stun2.bin`, `ACTIVE_DISCORD_UDP.bin` (список — `UT_FAKES`). Если какого-то пакета нет, `ut_ensure` скачивает релиз заново.
 
 `zapret-mac.sh utunws-run`:
 
@@ -38,13 +41,15 @@ utunws — nfqws из zapret v72.13 с macOS-входом и выходом из
 
 Каждый профиль привязан к адресам через `--ipset-ip`:
 
-1. **Discord** — TCP 443, 2053, 2083, 2087, 2096, 8443 к адресам Discord (`<zm_ds4>`), стратегия из настройки `UT_D`:
+1. **Discord** — TCP 443, 2053, 2083, 2087, 2096, 8443 к адресам Discord (`<zm_ds4>`), стратегия из настройки `UT_D`. Все 19 стратегий — из пресетов Flowseal (`ut|…` в `strategies.conf`), подбор идёт по порядку:
 
-   | № | Название | Параметры (Flowseal) |
-   |---|---|---|
-   | 1 | SEQOVL | `--dpi-desync=multisplit --dpi-desync-split-seqovl=568 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern=tls_clienthello_4pda_to.bin` |
-   | 2 | FAKE | `--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fake-tls=tls_clienthello_www_google_com.bin` |
-   | 3 | FAKESEQOVL | `--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-fooling=badseq …` |
+   | Название | Приём |
+   |---|---|
+   | SEQOVL | `multisplit` с наложением 568 байт ClientHello 4pda.to (у Flowseal — `general`) |
+   | FAKE | поддельный ClientHello `www.google.com`, `fooling=ts` (`simple-fake`) |
+   | FAKESEQOVL | `fake,multisplit` с наложением, `fooling=badseq` (`fake-tls-auto-alt2`) |
+   | ALT … ALT12, EXP | `fake,fakedsplit`, `hostfakesplit` с ya.ru и ozon.ru, `badseq`, поддельные STUN и ClientHello max.ru |
+   | FAKEALT, FAKEALT2, AUTOALT, AUTOALT3 | варианты `simple-fake` и `fake-tls-auto` |
 
 2. **YouTube** — только если `YT=utunws`: TCP 443 к адресам Google (`<zm_g4>`), `--ip-id=zero --dpi-desync=hostfakesplit --dpi-desync-fooling=ts --dpi-desync-hostfakesplit-mod=host=www.google.com`.
 3. **Голос** — UDP 19294–19344 и 50000–50100, `--filter-l7=discord,stun --dpi-desync=fake` с `ACTIVE_DISCORD_UDP.bin`.
@@ -62,6 +67,8 @@ utunws — nfqws из zapret v72.13 с macOS-входом и выходом из
 | utunws `SEQOVL` | Discord открывается | Discord открывается |
 | utunws `hostfakesplit`, YouTube | — | YouTube открывается |
 
+24 октября 2026 года у домашнего провайдера первые три стратегии utunws перестали открывать Discord (0 из 5), а из стратегий tpws для YouTube большинство открывает главную и картинки, но не `redirector.googlevideo.com`. Блокировка — по имени сайта: ClientHello с чужим именем на адрес Discord проходит. Поэтому в 3.0 добавлены остальные варианты Flowseal; какие из них работают у этого провайдера, ещё не проверено.
+
 utunws работает только в прозрачном режиме. Без него (`UTUNWS=0`, не скачался, не поднялся) Discord идёт через tpws, как в 2.1.
 
 ## Правила pf
@@ -71,8 +78,10 @@ utunws работает только в прозрачном режиме. Бе�
 ```
 rdr pass on lo0 inet proto tcp from !127.0.0.0/8 to !<zm_skip4> port { 80, 443 } -> 127.0.0.1 port 988
 block return out quick inet proto udp from any to <zm_quic4> port 443 user { >root }
-pass out route-to (lo0 127.0.0.1) inet proto tcp from !127.0.0.0/8 to !<zm_skip4> port { 80, 443 } user { >root }
+pass out quick route-to (lo0 127.0.0.1) inet proto tcp from !127.0.0.0/8 to !<zm_skip4> port { 80, 443 } user { >root }
 ```
+
+`quick` обязателен. В pf без него побеждает последнее подходящее правило, а общий доступ к интернету macOS (его включают и виртуальные машины с общей сетью — UTM, Docker) кладёт после наших якорей `com.apple.internet-sharing/base_v4` с правилом `pass on en0 all flags any keep state`. Без `quick` оно перекрывало перехват, и программы шли мимо tpws напрямую — до 3.0 так и было, когда работала такая виртуальная машина. Пересылаемый трафик самой машины перехват не задевает: у него нет владельца-сокета, а `user > 0` с «неизвестным» владельцем не совпадает.
 
 Такие же правила есть для IPv6 (через `fe80::1` на lo0).
 
@@ -82,6 +91,8 @@ pass out route-to (lo0 127.0.0.1) inet proto tcp from !127.0.0.0/8 to !<zm_skip4
 pass out quick on utun50 all no state
 pass out quick on en0 route-to (utun50 10.77.0.2) inet proto tcp from any to <zm_ds4> port { 443, 2053, 2083, 2087, 2096, 8443 } user { >root } no state
 pass out quick on en0 route-to (utun50 10.77.0.2) inet proto udp from any to !<zm_skip4> port { 19294:19344, 50000:50100 } user { >root } no state
+pass in quick on en0 inet proto tcp from <zm_ds4> port { 443, 2053, 2083, 2087, 2096, 8443 } to any no state
+pass in quick on en0 inet proto udp from any port { 19294:19344, 50000:50100 } to any no state
 block return out quick on en0 inet proto udp from any to <zm_ds4> port 443 user { >root }
 block return out quick on en0 inet6 proto { tcp, udp } from any to <zm_ds6> user { >root }
 ```
@@ -97,6 +108,7 @@ block return out quick on en0 inet6 proto { tcp, udp } from any to <zm_g6> port 
 - `<zm_ds4>` — адреса Discord: на Cloudflare `162.159.128.0/21` и `162.159.136.0/22` (`discord.com`, `gateway.discord.gg`, `cdn.discordapp.com`, `media.discordapp.net`, `discord.media`) и сервер обновлений `stable.dl2.discordapp.net` в Google Cloud.
 - `<zm_g4>`, `<zm_g6>` — сервисы Google без Google Cloud, та же таблица, что для QUIC.
 - Первое правило нужно потому, что пакет, отправленный через `route-to` в другой интерфейс, pf проверяет ещё раз уже на нём, и без него пакет перехватило бы правило tpws, у которого нет привязки к интерфейсу.
+- Правила `pass in … no state` для ответов нужны из-за того же правила общего доступа: по ответу сервера на SYN, ушедший в utunws без состояния, оно создавало состояние, и дальше пакеты соединения шли по нему напрямую, мимо utunws. utunws видел только SYN, и любая стратегия давала Discord 0 из 5. Такие же правила есть в якоре подбора `zapret-mac-test`.
 - QUIC к Discord и Discord по IPv6 сразу получают отказ, и приложение уходит на TCP по IPv4 — то есть в utunws.
 - Пакеты, которые utunws пишет через BPF, через pf не проходят.
 
@@ -106,9 +118,11 @@ block return out quick on en0 inet6 proto { tcp, udp } from any to <zm_g6> port 
 - `<zm_skip4>` — локальные сети: 10/8, 172.16/12, 192.168/16, 100.64/10 и служебные диапазоны.
 - `<zm_quic4>` — сервисы Google без Google Cloud. `block return` сразу отвечает браузеру отказом, и он без задержки переходит с HTTP/3 на TCP.
 
-Сначала правила грузятся в дочерний якорь `com.apple/zapret-mac`, и `/etc/pf.conf` не меняется. Скрипт проверяет, что перенаправление правда работает: открывает сайт от имени пользователя и ищет в таблице состояний pf соединение на `127.0.0.1:988`. Если его нет, скрипт, как установщик zapret, вписывает в `/etc/pf.conf` строки `rdr-anchor "zapret-mac/*"` и `anchor "zapret-mac/*"` (копия оригинала сохраняется в `/opt/zapret-mac/pf.conf.orig`) и использует якорь `zapret-mac/zapret-mac`. Если не помогает и это, включается режим SOCKS-прокси.
+Сначала правила грузятся в дочерний якорь `com.apple/zapret-mac`, и `/etc/pf.conf` не меняется. Скрипт проверяет, что перенаправление правда работает (`redirect_works`): открывает сайт от имени пользователя со случайного локального порта и ищет в таблице состояний pf именно это соединение на `127.0.0.1:988`. Искать просто «какое-нибудь соединение на 127.0.0.1:988» нельзя: долгие соединения остаются в таблице с тех пор, когда перехват работал, и проверка проходила бы и без него. Сторож повторяет эту проверку перед каждой проверкой сайтов и, если перехват не работает, перезагружает правила. Если его нет, скрипт, как установщик zapret, вписывает в `/etc/pf.conf` строки `rdr-anchor "zapret-mac/*"` и `anchor "zapret-mac/*"` (копия оригинала сохраняется в `/opt/zapret-mac/pf.conf.orig`) и использует якорь `zapret-mac/zapret-mac`. Если не помогает и это, включается режим SOCKS-прокси.
 
 pf включается через `pfctl -E` с токеном, а не `pfctl -e`, чтобы не выключить его для других программ.
+
+AmneziaVPN, подключаясь, грузит в pf файл с `set skip on lo0`: это глобальный параметр, и pf перестаёт обрабатывать lo0 совсем — вместе с нашим `rdr`, через который трафик попадает в tpws. После отключения VPN флаг остаётся. Поэтому `fw_on` и сверка сторожа проверяют `pfctl -s Interfaces -v` и, если lo0 помечен как skip, загружают пустой набор параметров (`pfctl -O -f -` без `-m`): неуказанные параметры возвращаются к значениям по умолчанию, правила не трогаются.
 
 ## Сторож
 
@@ -116,15 +130,34 @@ pf включается через `pfctl -E` с токеном, а не `pfctl 
 
 | Состояние | Условие | Что делает |
 |---|---|---|
+| `paused` | есть `/opt/zapret-mac/run/pause` и время в нём не прошло (0 — без срока) | то же, что при VPN; время вышло — файл удаляется, обход возвращается |
 | `vpn` | маршрут до 8.8.8.8 идёт через `utun*`, `ipsec*`, `ppp*`, `tun*` или `wg*` | снимает правила pf, перезапускает tpws, чтобы оборвать завёрнутые в него соединения |
 | `down` | tpws не слушает порт | снимает правила pf, чтобы не пропал интернет |
 | `direct` | VPN нет, tpws работает | ставит правила pf, если их нет, pf выключен или правила utunws не совпадают с тем, работает ли он |
 
+Состояние сторож пишет в `/opt/zapret-mac/run/status` (`состояние подробности`): для `vpn` — интерфейс и имя клиента (Happ, AmneziaVPN, Incy… — из `scutil --nc list` или по процессам), для `paused` — до какого времени. Приложение следит за этой папкой и меняет значок сразу.
+
 При каждой полной сверке сторож сравнивает интерфейс, шлюз и MAC шлюза с теми, что utunws получил при запуске. Сменились — перезапускает utunws: его кадры адресованы старому шлюзу.
+
+### Стратегии для каждой сети
+
+Сеть узнаётся по MAC шлюза (`net_id`): у домашнего роутера и у iPhone с раздачей он свой, даже если адреса совпадают. После удачного подбора `S_Y`, `S_D`, `UT_D` и `YT` записываются в `/opt/zapret-mac/networks/<MAC>`. Когда сторож видит новую сеть или возвращается в `direct`, он ставит стратегии этой сети (`net_apply`) и перезапускает только то, что поменялось. Через 8 секунд проверка покажет, работают ли они.
+
+### Пробуждение
+
+`read -t 5` ждёт события не дольше 5 секунд. Если с прошлого круга прошло больше 30 секунд, значит, Mac спал: сторож забывает сеть, сразу делает полную сверку и проверяет сайты через 10 секунд. Сеть после пробуждения поднимается не сразу, поэтому, если интернета ещё нет, проверка повторяется через полминуты, а не через 30 минут.
+
+### Обновление стратегий
+
+Раз в сутки (и через две минуты после запуска, если ни разу не обновлялись) сторож запускает отдельным процессом `zapret-mac.sh update-strategies auto`. Тот скачивает `strategies.conf` и списки Flowseal; если параметры текущих стратегий поменялись, перезапускает tpws и utunws. Сторож замечает новый файл по времени изменения и перечитывает его.
+
+### Уведомления
+
+Сторож дописывает события в `/opt/zapret-mac/run/events` (`время|текст`): переподбор стратегий, «ничего не открывается — включи VPN», обновление стратегий. Если приложение открыто, уведомление показывает оно, иначе — `osascript`. О переключении VPN уведомлений нет.
 
 VPN-клиент в режиме системного прокси (без TUN) маршрут не меняет, поэтому обход остаётся включённым: программы, которые прокси не слушают, всё равно идут через tpws.
 
-Проверка YouTube и Discord идёт через 8 секунд после перехода в `direct`, после смены сети и потом раз в 30 минут. Сторож качает сжатые страницы, чтобы не тратить лишний трафик. Если два раза подряд что-то не открылось, он запускает подбор в фоне:
+Проверка YouTube и Discord идёт через 8 секунд после перехода в `direct`, после смены сети и потом раз в 30 минут. Итог каждой проверки сторож пишет в журнал (`Проверка: YouTube 3/3 · Discord 5/5 · свои сайты 1/2`) и в `run/check` — его показывает приложение. Сторож качает сжатые страницы, чтобы не тратить лишний трафик. Если два раза подряд что-то не открылось, он запускает подбор в фоне:
 
 1. сначала проверяет текущие стратегии через отдельные tpws и utunws — если они рабочие, значит, сломалось перенаправление, и сторож перезапускает tpws, utunws и pf;
 2. иначе перебирает все стратегии и оставляет лучшие для YouTube и для Discord;
@@ -150,6 +183,10 @@ pass out quick on utun51 all no state
 pass out quick on en0 route-to (utun51 10.77.1.2) inet proto tcp from any to <zm_t4> port { 443, … } user root no state
 ```
 
+Стратегию, которая открыла всё, подбор проверяет второй раз (`recheck_full`) и берёт меньший из двух баллов: на нестабильной сети ТСПУ иногда пропускает соединение случайно, и иначе подбор сохранил бы стратегию, которая не работает.
+
+Ход подбора скрипт пишет в `run/progress` (`проценты|что сейчас|кто подбирает`) — по нему приложение рисует кольцо.
+
 Порядок подбора с utunws:
 
 1. стратегии tpws — только для YouTube;
@@ -157,6 +194,8 @@ pass out quick on en0 route-to (utun51 10.77.1.2) inet proto tcp from any to <zm
 3. если tpws открывает YouTube не полностью — YouTube через utunws с лучшей стратегией для Discord. Открывает больше — YouTube переходит на utunws (`YT=utunws`).
 
 Без utunws обе группы подбираются через tpws, как раньше.
+
+Свои сайты (группа `U`, первые пять из `list-user.txt`) в основной подбор не входят: сайт может быть закрыт по адресу, и тогда сторож подбирал бы стратегии без конца. Для них есть отдельная команда `sites-select` — она перебирает стратегии tpws для `S_D`. Если Discord идёт через tpws (без utunws), у него та же стратегия, и Discord при выборе важнее.
 
 «Проверить» при включённом VPN показывает и utunws: в якорь `zapret-mac-test` добавляются правила для рабочего utunws, а curl открывает адреса от имени пользователя через `--interface en0`, мимо туннеля.
 
@@ -167,12 +206,73 @@ pass out quick on en0 route-to (utun51 10.77.1.2) inet proto tcp from any to <zm
 | Ключ | По умолчанию | Значение |
 |---|---|---|
 | `MODE` | `transparent` | `transparent` или `socks` |
-| `S_Y`, `S_D` | `1` | номера стратегий для YouTube и Discord |
+| `S_Y`, `S_D` | `general` | названия стратегий tpws для YouTube и для Discord со своими сайтами (2.x хранила номера — `cfg_migrate` переводит их в названия) |
 | `QUIC` | `1` | глушить QUIC к Google |
 | `AUTOFIX` | `1` | сторож сам подбирает стратегии |
 | `AUTOLIST` | `0` | профиль автосписка tpws |
 | `PF_ROOT` | `com.apple` | `com.apple` или `zapret-mac` — куда подключены правила pf |
 | `UTUNWS` | `1` | Discord через utunws |
-| `UT_D` | `1` | стратегия utunws для Discord |
+| `UT_D` | `SEQOVL` | название стратегии utunws для Discord |
+| `USER_SITES` | `1` | пускать в обход свои сайты из `list-user.txt` |
 | `YT` | `tpws` | `tpws` или `utunws` — чем обходить YouTube |
 | `TP_OK` | — | `1`, когда прозрачный режим проверен на этом Mac |
+
+## strategies.conf
+
+Строки `вид|название|параметры`:
+
+| Вид | Что это |
+|---|---|
+| `version` | версия файла, `ГГГГММДДNN`; новый файл принимается, только если номер больше |
+| `tpws` | стратегия tpws; `@HL` — списки доменов |
+| `ut` | стратегия utunws для Discord; `@F` — папка с поддельными пакетами |
+| `utyt` | стратегия utunws для YouTube (одна) |
+
+Файл приходит с GitHub, а параметры получает root, поэтому `strat_parse` принимает только:
+
+- знакомые опции (`strat_tok_ok`): у tpws — разрезание и перестановка, у utunws — `--dpi-desync*`, `--dup*`, `--orig*`, `--ip-id` и несколько похожих;
+- значения из букв, цифр и `._,:+=@/-`, без путей к файлам, кроме поддельных пакетов `@F/<имя>.bin` из `UT_FAKES`;
+- у tpws в каждом блоке между `--new` должен быть `@HL` — иначе стратегия трогала бы все сайты.
+
+Перед установкой `strat_dry` прогоняет каждую стратегию через `tpws --dry-run` и `utunws --dry-run`. Не прошла хоть одна — остаётся прежний файл. Встроенные в скрипт стратегии совпадают с файлом из репозитория (это проверяет `tests/strategies.sh`) и нужны, если файла нет или он битый.
+
+## Приложение Zapret
+
+SwiftUI-приложение без окна в Dock (`LSUIElement`), собирается без Xcode: `bash app/build.sh`.
+
+| Файл | Что там |
+|---|---|
+| `main.swift` | запуск, значок в строке меню (левый щелчок — панель, правый — меню) |
+| `Panel.swift` | окно панели: без рамки, принимает ввод, не делая приложение активным; вырастает из значка пружиной |
+| `Model.swift` | состояние из `info`, команды через `sudo -n`, слежение за `/opt/zapret-mac/run`, свои сайты |
+| `MainView.swift`, `Pages.swift` | главная кнопка, пауза, шторка, «Дополнительно», «Логи», установка службы |
+| `DomainScanner.swift` | поиск доменов, с которых сайт грузит картинки и скрипты (невидимый WebKit) |
+| `System.swift` | вход в систему, уведомления, обновление приложения из релизов GitHub |
+| `Snapshot.swift` | `Zapret --snapshot ПАПКА` — панель в разных состояниях в PNG, без службы |
+
+### Как приложение управляет службой
+
+Один раз, с паролем администратора, приложение запускает через `osascript` свою копию скрипта: `zapret-mac.sh gui-install ПОЛЬЗОВАТЕЛЬ`. Она ставит zapret-mac в `/opt/zapret-mac` (вместе с `strategies.conf`, если он новее) и правило
+
+```
+ПОЛЬЗОВАТЕЛЬ ALL=(root) NOPASSWD: /opt/zapret-mac/zapret-mac.sh
+```
+
+в `/etc/sudoers.d/zapret-mac` (сначала его проверяет `visudo -c`). Скрипт принадлежит root, поэтому подменить его без пароля нельзя, но любая программа этого пользователя может запускать его команды. Приложение просит переустановить службу, если скрипт в `/opt` отличается от того, что внутри приложения.
+
+Команды для приложения:
+
+| Команда | Что делает |
+|---|---|
+| `info` | состояние строками `ключ=значение`, работает без root |
+| `on` | знакомая сеть — её стратегии; проверка сохранённых, подбор, если не работают; включение |
+| `off` | выключить (то же, что `stop`) |
+| `pause МИНУТ`, `resume` | пауза (0 — без срока) и её снятие |
+| `update-strategies` | `strategies.conf` с GitHub и списки Flowseal |
+| `check-now` | проверка в журнал и `run/check` |
+| `sites on\|off`, `site-add ДОМЕН…`, `site-del ДОМЕН…`, `sites-select` | свои сайты |
+| `dns on\|off`, `uninstall yes` | DNS Google/Cloudflare, удаление без вопроса |
+
+`on` и `sites-select` пишут ход ещё и в `log/select.log`. Если приложение прерывает подбор, `sudo` передаёт сигнал скрипту, и тот убирает временные правила pf.
+
+Свой сайт приложение проверяет само, обычным HTTPS-запросом: от пользователя он идёт через pf и tpws, как из браузера. Связанные домены оно ищет, открывая сайт в невидимом WebKit и собирая адреса загрузок (`performance.getEntriesByType('resource')` и `src`/`href` ресурсов). Домен, которого нет в списках, tpws пропускает без изменений, поэтому запрос к нему — это запрос напрямую: если он не открылся, домен, скорее всего, тоже блокируют, и приложение отмечает его сразу.

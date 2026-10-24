@@ -65,7 +65,7 @@ SOFTWARE.
 
 https://github.com/Flowseal/zapret-mac-discord-youtube
 
-zapret-mac не включает файлы этого проекта. При установке из его релиза скачиваются `utunws` (nfqws из zapret с входом через `utun` и выходом через BPF) и поддельные пакеты `tls_clienthello_www_google_com.bin`, `tls_clienthello_4pda_to.bin` и `ACTIVE_DISCORD_UDP.bin`; контрольные суммы SHA-256 сверяются. Стратегии utunws (`general`, `simple-fake`, `fake-tls-auto-alt2` и профиль YouTube) — из этого проекта. Лицензия — MIT:
+zapret-mac не включает файлы этого проекта. При установке из его релиза скачиваются `utunws` (nfqws из zapret с входом через `utun` и выходом через BPF) и поддельные пакеты `tls_clienthello_www_google_com.bin`, `tls_clienthello_4pda_to.bin`, `tls_clienthello_max_ru.bin`, `stun.bin`, `stun2.bin` и `ACTIVE_DISCORD_UDP.bin`; контрольные суммы SHA-256 сверяются. Все стратегии utunws в `strategies.conf` (профили Discord из пресетов `general`, `general-alt*`, `general-simple-fake*`, `general-fake-tls-auto*`, `general-exp` и профиль YouTube) — из этого проекта. Лицензия — MIT:
 
 ```
 MIT License

@@ -30,12 +30,31 @@ jobs:
           sum=$(sed -n 's/^UTUNWS_SHA256="\(.*\)"$/\1/p' zapret-mac.sh)
           curl -fsSL -o ut.zip "${url//\$UTUNWS_TAG/$tag}"
           p=ZapretMac.app/Contents/Resources/Payload/bin
-          unzip -q ut.zip "$p/utunws" "$p/tls_clienthello_www_google_com.bin" "$p/ACTIVE_DISCORD_UDP.bin" "$p/tls_clienthello_4pda_to.bin"
+          unzip -q ut.zip "$p/utunws" "$p/tls_clienthello_www_google_com.bin" "$p/ACTIVE_DISCORD_UDP.bin" "$p/tls_clienthello_4pda_to.bin" \
+            "$p/tls_clienthello_max_ru.bin" "$p/stun.bin" "$p/stun2.bin"
           echo "$sum  $p/utunws" | shasum -a 256 -c
           echo "ZM_UTUNWS=$PWD/$p/utunws" >> "$GITHUB_ENV"
 
       - name: tpws и utunws принимают все стратегии
         run: /bin/bash tests/dry-run.sh
+
+      - name: strategies.conf разбирается, опасные строки отклоняются
+        run: /bin/bash tests/strategies.sh
+
+  app:
+    name: macOS — приложение Zapret
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Собрать Zapret.app
+        run: bash app/build.sh
+
+      - name: Zapret.zip для релиза
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zapret
+          path: app/build/Zapret.zip
 
   shellcheck:
     name: ShellCheck
@@ -43,4 +62,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Ошибки ShellCheck
-        run: shellcheck --severity=error zapret-mac.sh tests/dry-run.sh
+        run: shellcheck --severity=error zapret-mac.sh tests/dry-run.sh tests/strategies.sh app/build.sh

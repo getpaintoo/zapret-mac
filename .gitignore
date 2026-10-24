@@ -1,3 +1,5 @@
 .DS_Store
 *.tgz
 zapret-v*/
+app/.build/
+app/build/
