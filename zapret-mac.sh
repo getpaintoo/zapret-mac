@@ -698,7 +698,7 @@ DS_UDP="19294:19344, 50000:50100"   # голос Discord
 # В стандартном /etc/pf.conf есть якоря com.apple/* — наши правила живут там же
 # и /etc/pf.conf не трогают. Если не сработает — как оригинальный zapret,
 # прописываем свой якорь zapret-mac/* в /etc/pf.conf (PF_ROOT=zapret-mac).
-anchor_main() { printf '%s/zapret-mac' "$(cfg PF_ROOT com.apple)"; }
+anchor_main() { printf '%s/zapret-mac' "${FORCE_ROOT:-$(cfg PF_ROOT com.apple)}"; }   # FORCE_ROOT — для redirect-test
 anchor_test() { printf '%s/zapret-mac-test' "$(cfg PF_ROOT com.apple)"; }
 
 # Discord → utunws. pf выпускает пакет из физического интерфейса в utun50 (route-to),
@@ -2544,6 +2544,57 @@ cmd_diag() {
   say "── utunws.log"; tail -n 3 "$LOGS/utunws.log" 2>/dev/null | sed 's/^/   /'
 }
 
+# Проверка перехвата программ в tpws, которую можно запустить и при включённом VPN: правило
+# перехвата не привязано к интерфейсу, поэтому трафик программ, идущий в туннель, проходит тот
+# же путь «pf → lo0 → rdr → tpws». Правила грузятся на время проверки в оба якоря по очереди,
+# tpws в прозрачном режиме поднимается временный, если основной не такой. Печатает счётчики
+# правил pf (сработали ли перехват и rdr) и что увидел tpws. Сторож на это время правила не трогает
+cmd_redirect_test() {
+  local tp="" log="$LOGS/redirect-test.tpws.log" root ok=""
+  mkdir -p "$RUN" "$LOGS"; : > "$RUN/fw-test"
+  trap '[ -n "$tp" ] && kill "$tp" 2>/dev/null; rm -f "$RUN/fw-test"; exit 130' INT TERM HUP
+  say "VPN: $(vpn_iface || echo нет) · режим: $(mode_name) · PF_ROOT: $(cfg PF_ROOT com.apple)"
+  if [ "$(cfg MODE transparent)" = transparent ] && tpws_up transparent; then
+    say "tpws: основной, прозрачный, порт $TP_PORT"
+  else
+    if port_bound "$TP_PORT"; then err "Порт $TP_PORT занят — проверка невозможна"; rm -f "$RUN/fw-test"; return 1; fi
+    build_main_args transparent
+    "$TPWS" "${ARGS[@]}" --debug=1 > "$log" 2>&1 &
+    tp=$!
+    if ! wait_bound "$TP_PORT" 60; then err "Временный tpws не запустился:"; tail -n 5 "$log"; kill "$tp" 2>/dev/null; rm -f "$RUN/fw-test"; return 1; fi
+    say "tpws: временный, прозрачный, порт $TP_PORT (журнал: $log)"
+  fi
+  pf_take "$RUN/pf-token-rt"
+  for root in zapret-mac com.apple; do
+    if [ "$root" = zapret-mac ] && ! pfctl -sn 2>/dev/null | grep -qF 'rdr-anchor "zapret-mac/*"'; then
+      say ""; say "── якорь zapret-mac/zapret-mac: точки подключения нет в загруженном наборе pf — пропускаю"; continue
+    fi
+    FORCE_ROOT=$root
+    fw_off
+    pf_rules_main | pf_load "$(anchor_main)" || { FORCE_ROOT=""; continue; }
+    say ""; say "── якорь $(anchor_main)"
+    if redirect_works; then say "   перехват: РАБОТАЕТ"; ok="$ok $root"; else say "   перехват: не работает"; fi
+    say "   $REDIR_INFO"
+    say "   счётчики (Evaluations/Packets/States):"
+    { pfctl -vv -a "$(anchor_main)" -sn; pfctl -vv -a "$(anchor_main)" -sr; } 2>/dev/null |
+      awk '/^@/ {r=$0} /Evaluations/ && r ~ /(rdr pass on lo0 inet proto tcp)|(route-to \(lo0 127)/ {print "     " substr(r,1,90); print "       " $0; r=""}'
+    fw_off
+    FORCE_ROOT=""
+  done
+  pf_give "$RUN/pf-token-rt"
+  if [ -n "$tp" ]; then
+    kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
+    say ""; say "── временный tpws видел соединений: $(grep -c 'connected from' "$log" 2>/dev/null)"
+    grep -E 'connected from|original destination|target|resolv' "$log" 2>/dev/null | head -8 | sed 's/^/   /'
+  fi
+  # вернуть, как было: в прозрачном режиме без VPN и без паузы правила должны стоять
+  if [ -f "$PL_TPWS" ] && [ "$(cfg MODE transparent)" = transparent ] && ! vpn_iface >/dev/null && ! paused; then fw_on >/dev/null 2>&1; fi
+  rm -f "$RUN/fw-test"
+  trap - INT TERM HUP
+  say ""
+  if [ -n "$ok" ]; then ok "Перехват работает с якорем:$ok"; else err "Перехват не работает ни с одним якорем"; return 1; fi
+}
+
 # Из приложения с правами администратора, один раз: ставит zapret-mac в /opt и правило
 # sudo, по которому приложение запускает /opt/zapret-mac/zapret-mac.sh без пароля.
 # Скрипт там принадлежит root, так что подменить его, не зная пароля, нельзя. $1 — пользователь
@@ -2565,6 +2616,8 @@ cmd_gui_install() {
     warn "В /etc/sudoers нет #includedir — приложению будет нужен пароль."
   log "Установлен из приложения: zapret-mac $ZM_VERSION"
   ok "zapret-mac $ZM_VERSION установлен, приложение управляет им без пароля."
+  # обновление снова пробует прозрачный режим, как и «Включить»: SOCKS мог остаться от сбоя
+  [ "$(cfg MODE transparent)" = socks ] && { cfg_set MODE transparent; cfg_set TP_OK 0; }
   [ -f "$PL_TPWS" ] && cmd_start   # был включён — перезапускаем с новым кодом
   return 0
 }
@@ -2640,6 +2693,8 @@ notify() {
 
 reconcile() {   # $1 = full — проверить pf и tpws; без него — только не сменился ли VPN
   local vpn mode st net extra=""
+  # идёт redirect-test: правила pf на эти секунды его
+  [ -f "$RUN/fw-test" ] && [ $(( $(date +%s) - $(stat -f %m "$RUN/fw-test" 2>/dev/null || echo 0) )) -lt 120 ] && return 0
   vpn=$(vpn_iface)
   [ "$1" = full ] || [ "$vpn" != "$WD_VPN" ] || return 0
   mode=$(cfg MODE transparent)
@@ -3025,7 +3080,7 @@ menu() {
 
 usage() {
   say "Использование: bash $0 [auto|start|stop|restart|test [all]|check|status|discord|autostart|add|dns|update|uninstall]"
-  say "Для приложения: on|off|pause МИНУТ|resume|info|check-now|diag|debug on|off|update-strategies|sites on|off|site-add ДОМЕН…|site-del ДОМЕН…|sites-select|dns on|off|uninstall yes|gui-install ПОЛЬЗОВАТЕЛЬ"
+  say "Для приложения: on|off|pause МИНУТ|resume|info|check-now|diag|redirect-test|debug on|off|update-strategies|sites on|off|site-add ДОМЕН…|site-del ДОМЕН…|sites-select|dns on|off|uninstall yes|gui-install ПОЛЬЗОВАТЕЛЬ"
 }
 
 # для тестов: ZM_LIB=1 . zapret-mac.sh — подключить функции, ничего не запуская
@@ -3059,6 +3114,7 @@ if [ "$(id -u)" -eq 0 ]; then
     info)      cmd_info ;;
     check-now) cmd_check_now ;;
     diag)      cmd_diag ;;
+    redirect-test) cmd_redirect_test ;;
     debug)     cmd_debug "${2:-}" ;;
     update-strategies) cmd_update_strategies "${2:-}" ;;
     sites)     cmd_sites "${2:-}" ;;
