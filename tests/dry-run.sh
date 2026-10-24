@@ -9,7 +9,7 @@
 here=$(cd "$(dirname "$0")/.." && pwd)
 [ -x "${ZM_TPWS:-}" ] || { echo "Укажи tpws: ZM_TPWS=/путь/к/tpws bash $0" >&2; exit 2; }
 
-ZM_LIB=1 . "$here/zapret-mac.sh"
+ZM_STRAT="$here/strategies.conf" ZM_LIB=1 . "$here/zapret-mac.sh"
 
 tmp=$(mktemp -d /tmp/zapret-mac-test.XXXXXX) || exit 1
 trap 'rm -rf "$tmp"' EXIT

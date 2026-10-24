@@ -19,7 +19,14 @@
 #  VPN: пока VPN в режиме TUN включён, сторож снимает перенаправление и весь
 #  трафик идёт через VPN. Выключили VPN — обход включается сам за доли
 #  секунды. Сторож же периодически проверяет YouTube и Discord и, если они
-#  перестали открываться, сам подбирает новые стратегии.
+#  перестали открываться, сам подбирает новые стратегии. Подобранные стратегии
+#  он запоминает для каждой сети (по MAC шлюза) и ставит их сразу, когда
+#  Mac снова в ней оказывается — в том числе после пробуждения.
+#
+#  Стратегии лежат в strategies.conf; раз в сутки сторож скачивает свежий
+#  с GitHub. Приложение Zapret в строке меню (папка app/) — пульт к этому
+#  скрипту: команды on, off, pause, resume и другие оно запускает через sudo
+#  без пароля (правило /etc/sudoers.d/zapret-mac ставит gui-install).
 #
 #  Запуск:  bash zapret-mac.sh            — меню
 #           bash zapret-mac.sh auto       — подобрать стратегии и включить
@@ -31,7 +38,7 @@
 #           (если якорь в /etc/pf.conf — sudo pfctl -a zapret-mac/zapret-mac -F all)
 # ════════════════════════════════════════════════════════════════════
 
-ZM_VERSION="2.3"
+ZM_VERSION="3.0"
 ZAPRET_TAG="v72.13"
 TPWS_SHA256="441524a76f52597a0e5c816d25ed1adfd93e5c34cc56c56e0dc00533929d1761"
 # utunws и поддельные пакеты для него — из релиза Flowseal/zapret-mac-discord-youtube
@@ -41,6 +48,13 @@ UTUNWS_SHA256="d8ecffeb91df7e5d76c3d926037d44959f29079add2fd12a16574f5ad2beb4a8"
 FAKE_TLS_SHA256="936c2bee4cfb80aa3c426b2dcbcc834b3fbcd1adb17172959dc569c73a14275c"   # tls_clienthello_www_google_com.bin
 FAKE_DS_SHA256="2fe18b3bd20807d36704d0b072092ee49ae84edca907a4420ab9a0f0f28fddcf"    # ACTIVE_DISCORD_UDP.bin
 FAKE_4PDA_SHA256="eefeaf09dde8d69b1f176212541f63c68b314a33a335eced99a8a29f17254da8"  # tls_clienthello_4pda_to.bin
+FAKE_MAX_SHA256="4ee0870abe0a0128600b0095189987ba1d210dae8bf963bc725aff49cf922624"   # tls_clienthello_max_ru.bin
+FAKE_STUN_SHA256="9cd5469309780ca56c0bd97266524a48c7ee529d02c3179cfecb20b260a59641"  # stun.bin
+FAKE_STUN2_SHA256="b7c2497496039c541f7337ac8536813f0a1cf52363ab2faa5213b7816d458813" # stun2.bin
+# поддельные пакеты, которые ставятся рядом с utunws, и их контрольные суммы
+UT_FAKES="tls_clienthello_www_google_com.bin:$FAKE_TLS_SHA256 ACTIVE_DISCORD_UDP.bin:$FAKE_DS_SHA256
+tls_clienthello_4pda_to.bin:$FAKE_4PDA_SHA256 tls_clienthello_max_ru.bin:$FAKE_MAX_SHA256
+stun.bin:$FAKE_STUN_SHA256 stun2.bin:$FAKE_STUN2_SHA256"
 
 # всё лежит в папке root: её запускают системные демоны, править её может только админ
 DIR="/opt/zapret-mac"
@@ -53,6 +67,13 @@ RUN="$DIR/run"
 CONF="$DIR/config"
 SELF="$DIR/zapret-mac.sh"
 DNS_BACKUP="$DIR/dns-backup"
+STRAT_FILE="${ZM_STRAT:-$DIR/strategies.conf}"   # ZM_STRAT — другой файл стратегий, для тестов
+STRAT_URL="https://raw.githubusercontent.com/getpaintoo/zapret-mac/main/strategies.conf"
+NETS="$DIR/networks"   # стратегии, которые сработали в каждой сети
+PAUSE_F="$RUN/pause"   # пауза до этого времени (секунды с 1970), 0 — пока не снимут
+SUDOERS="/etc/sudoers.d/zapret-mac"
+APP_PROC="Zapret"      # процесс приложения в строке меню: если оно открыто, уведомления показывает оно
+UPDATE_EVERY=86400     # как часто сторож скачивает свежие стратегии и списки, секунд
 TP_PORT=988          # tpws в прозрачном режиме (сюда pf заворачивает трафик)
 SOCKS_PORT=1080      # tpws в режиме SOCKS-прокси
 TEST_PORT=1090       # временный tpws для подбора стратегий
@@ -104,11 +125,13 @@ log()  { [ -d "$LOGS" ] && printf '%s %s\n' "$(date '+%d.%m %H:%M:%S')" "$*" >> 
 [ "$(uname -s)" = "Darwin" ] || die "Этот скрипт только для macOS."
 
 # ─── настройки (/opt/zapret-mac/config, строки КЛЮЧ=значение) ────────
-#   MODE=transparent|socks  S_Y, S_D — стратегии для YouTube и для Discord
-#   QUIC=1 — глушить QUIC к Google   AUTOFIX=1 — сторож сам подбирает стратегии
+#   MODE=transparent|socks  S_Y, S_D — стратегии tpws (названия) для YouTube и для
+#   Discord со своими сайтами   QUIC=1 — глушить QUIC к Google
+#   AUTOFIX=1 — сторож сам подбирает стратегии   USER_SITES=1 — пускать в обход свои сайты
 #   PF_ROOT=com.apple|zapret-mac — куда подключаются наши правила pf
 #   UTUNWS=1 — Discord через utunws; 0 — через tpws, как в 2.1
 #   UT_D — стратегия utunws для Discord   YT=tpws|utunws — чем обходить YouTube
+#   До 3.0 S_Y, S_D и UT_D хранили номера стратегий — cfg_migrate переводит их в названия
 cfg() { local v; v=$(sed -n "s/^$1=//p" "$CONF" 2>/dev/null | tail -n 1); printf '%s' "${v:-$2}"; }
 cfg_set() {
   touch "$CONF" && chmod 644 "$CONF" || return 1
@@ -118,9 +141,11 @@ cfg_set() {
 mode_name() { [ "$(cfg MODE transparent)" = socks ] && printf 'SOCKS-прокси' || printf 'прозрачный'; }
 
 # ─── стратегии tpws ──────────────────────────────────────────────────
-# @HL подставляется как набор --hostlist (обход только для доменов из списков).
-# На macOS --oob и --disorder для одного протокола вместе нельзя — tpws не запустится
-# (работает только в Linux), поэтому OOB-стратегии здесь без disorder.
+# Встроенные стратегии — на случай, если strategies.conf нет или он битый; в репозитории
+# они те же, что в strategies.conf. @HL подставляется как набор --hostlist (обход только
+# для доменов из списков). На macOS --oob и --disorder для одного протокола вместе нельзя —
+# tpws не запустится (работает только в Linux), поэтому OOB-стратегии здесь без disorder.
+STRAT_VER=2026102401
 STRATEGIES=(
 "general|@HL --filter-l7=tls --split-pos=1,midsld --disorder --tlsrec=sniext --new @HL --filter-l7=http --hostcase --split-pos=1 --disorder"
 "ALT|@HL --filter-l7=tls --split-pos=1,midsld --oob --new @HL --filter-l7=http --hostcase --hostdot --split-pos=1 --oob"
@@ -139,26 +164,21 @@ STRATEGIES=(
 "TLSREC|@HL --tlsrec=midsld --split-pos=1,midsld --disorder"
 "SIMPLE|@HL --split-pos=1"
 )
-NSTRAT=${#STRATEGIES[@]}
 
 strat_name() { local s=${STRATEGIES[$(( $1 - 1 ))]}; printf '%s' "${s%%|*}"; }
-
-strat_of() {   # $1 = Y (YouTube) | D (Discord и остальные сайты из списков)
-  local n
-  n=$(cfg "S_$1" 1)
-  case $n in ''|*[!0-9]*) n=1 ;; esac
-  { [ "$n" -ge 1 ] && [ "$n" -le "$NSTRAT" ]; } || n=1
-  printf '%s' "$n"
-}
+# $1 = Y (YouTube) | D (Discord, свои сайты и остальное из списков)
+strat_of() { strat_idx "$(cfg "S_$1" general)" tpws; }
 
 # набор листов для профиля tpws; результат — массив HL
 hl_set() {
   local -a ex=("--hostlist-exclude=$LISTS/list-exclude.txt" "--hostlist-exclude=$LISTS/list-exclude-mac.txt"
                "--hostlist-exclude=$LISTS/list-exclude-user.txt")
+  local -a us=()
+  [ "$(cfg USER_SITES 1)" = 1 ] && us=("--hostlist=$LISTS/list-user.txt")
   case $1 in
     youtube) HL=("--hostlist=$LISTS/list-youtube.txt" "${ex[@]}") ;;
-    general) HL=("--hostlist=$LISTS/list-general.txt" "--hostlist=$LISTS/list-user.txt" "${ex[@]}") ;;
-    all)     HL=("--hostlist=$LISTS/list-youtube.txt" "--hostlist=$LISTS/list-general.txt" "--hostlist=$LISTS/list-user.txt" "${ex[@]}") ;;
+    general) HL=("--hostlist=$LISTS/list-general.txt" "${us[@]}" "${ex[@]}") ;;
+    all)     HL=("--hostlist=$LISTS/list-youtube.txt" "--hostlist=$LISTS/list-general.txt" "${us[@]}" "${ex[@]}") ;;
     auto)    HL=("--hostlist-auto=$LISTS/list-auto.txt" "${ex[@]}") ;;
   esac
 }
@@ -220,19 +240,142 @@ UT_STRAT_D=(
 "SEQOVL|--dpi-desync=multisplit --dpi-desync-split-seqovl=568 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_4pda_to.bin"
 "FAKE|--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fake-tls=@F/tls_clienthello_www_google_com.bin"
 "FAKESEQOVL|--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=10000000 --dpi-desync-repeats=8 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_www_google_com.bin --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com"
+# дальше — остальные варианты Flowseal для Discord (zapret-mac-discord-youtube 1.1.2):
+# поддельные STUN и ClientHello с max.ru, hostfakesplit, badseq. Подбор идёт по порядку
+"ALT|--dpi-desync=fake,fakedsplit --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00 --dpi-desync-fake-tls=@F/stun.bin --dpi-desync-fake-tls=@F/tls_clienthello_www_google_com.bin"
+"ALT2|--dpi-desync=multisplit --dpi-desync-split-seqovl=652 --dpi-desync-split-pos=2 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_www_google_com.bin"
+"ALT3|--dpi-desync=fake,hostfakesplit --dpi-desync-fake-tls-mod=rnd,dupsid,sni=ya.ru --dpi-desync-hostfakesplit-mod=host=ya.ru,altorder=1 --dpi-desync-fooling=ts"
+"ALT4|--dpi-desync=fake,multisplit --dpi-desync-repeats=6 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=1000 --dpi-desync-fake-tls=@F/stun.bin --dpi-desync-fake-tls=@F/tls_clienthello_www_google_com.bin"
+"ALT6|--dpi-desync=multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_www_google_com.bin"
+"ALT7|--dpi-desync=multisplit --dpi-desync-split-pos=2,sniext+1 --dpi-desync-split-seqovl=679 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_www_google_com.bin"
+"ALT8|--dpi-desync=fake --dpi-desync-fake-tls-mod=none --dpi-desync-repeats=6 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=2"
+"ALT9|--dpi-desync=hostfakesplit --dpi-desync-repeats=4 --dpi-desync-fooling=ts,md5sig --dpi-desync-hostfakesplit-mod=host=ozon.ru"
+"ALT10|--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fake-tls=@F/stun.bin --dpi-desync-fake-tls=@F/tls_clienthello_4pda_to.bin"
+"ALT11|--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=664 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_max_ru.bin --dpi-desync-fake-tls=@F/stun2.bin --dpi-desync-fake-tls=@F/tls_clienthello_max_ru.bin"
+"ALT12|--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=664 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_max_ru.bin --dpi-desync-fake-tls=@F/stun.bin --dpi-desync-fake-tls=@F/tls_clienthello_max_ru.bin"
+"EXP|--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=480 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=4 --dpi-desync-split-seqovl-pattern=@F/stun2.bin --dpi-desync-fake-tls=@F/tls_clienthello_max_ru.bin"
+"FAKEALT|--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=2 --dpi-desync-fake-tls=@F/stun2.bin --dpi-desync-fake-tls=@F/tls_clienthello_www_google_com.bin"
+"FAKEALT2|--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fake-tls=@F/stun2.bin --dpi-desync-fake-tls=@F/tls_clienthello_max_ru.bin"
+"AUTOALT|--dpi-desync=fake,fakedsplit --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=2 --dpi-desync-repeats=8 --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com"
+"AUTOALT3|--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 --dpi-desync-split-seqovl-pattern=@F/tls_clienthello_www_google_com.bin --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com"
 )
-NUT=${#UT_STRAT_D[@]}
 # YouTube через utunws (YT=utunws) — на сетях, где tpws не справляется
 UT_YT="--ip-id=zero --dpi-desync=hostfakesplit --dpi-desync-fooling=ts --dpi-desync-hostfakesplit-mod=host=www.google.com"
+# по встроенному порядку cfg_migrate переводит номера стратегий из 2.x в названия
+BUILTIN_TP=("${STRATEGIES[@]}"); BUILTIN_UT=("${UT_STRAT_D[@]}")
+
+# ─── strategies.conf ─────────────────────────────────────────────────
+# Строки «вид|название|параметры»: tpws — стратегия tpws, ut — utunws для Discord,
+# utyt — utunws для YouTube; «version|ГГГГММДДNN» — версия файла. Файл приходит с GitHub,
+# а параметры получает root, поэтому принимаем только знакомые опции, без путей к файлам
+# (кроме поддельных пакетов @F/*.bin), и у tpws в каждом блоке должен быть @HL — иначе
+# стратегия трогала бы все сайты подряд.
+strat_tok_ok() {   # $1 = tpws|ut, $2 = токен
+  local o=${2%%=*} v=""
+  case $2 in *=*) v=${2#*=} ;; esac
+  case $1:$2 in tpws:@HL|tpws:--new) return 0 ;; esac
+  case $v in *[!A-Za-z0-9._,:+=@/-]*) return 1 ;; esac
+  case $1:$v in
+    tpws:*/*) return 1 ;;
+    ut:*/*) case $v in @F/tls_clienthello_www_google_com.bin|@F/tls_clienthello_4pda_to.bin|@F/ACTIVE_DISCORD_UDP.bin|\
+                       @F/tls_clienthello_max_ru.bin|@F/stun.bin|@F/stun2.bin) ;; *) return 1 ;; esac ;;
+  esac
+  case $1:$o in
+    tpws:--filter-l7|tpws:--split-pos|tpws:--disorder|tpws:--oob|tpws:--oob-data|tpws:--tlsrec|tpws:--hostcase|\
+    tpws:--hostdot|tpws:--hosttab|tpws:--hostnospace|tpws:--hostpad|tpws:--domcase|tpws:--methodspace|\
+    tpws:--methodeol|tpws:--unixeol|tpws:--mss|tpws:--tamper-start|tpws:--tamper-cutoff|tpws:--split-any-protocol|\
+    tpws:--fix-seg) return 0 ;;
+    ut:--dpi-desync|ut:--dpi-desync-*|ut:--ip-id|ut:--dup|ut:--dup-*|ut:--orig-*|ut:--wssize|ut:--wssize-cutoff|\
+    ut:--hostcase|ut:--hostnospace|ut:--domcase|ut:--methodeol) return 0 ;;
+  esac
+  return 1
+}
+
+strat_line_ok() {   # $1 = tpws|ut|utyt, $2 = параметры
+  local tok k=$1 hl=0 n=0
+  [ "$k" = utyt ] && k=ut
+  set -f
+  for tok in $2; do
+    n=$(( n + 1 ))
+    strat_tok_ok "$k" "$tok" || { set +f; return 1; }
+    case $tok in
+      @HL) hl=1 ;;
+      --new) [ "$hl" = 1 ] || { set +f; return 1; }; hl=0 ;;
+    esac
+  done
+  set +f
+  [ "$n" -gt 0 ] && { [ "$k" = ut ] || [ "$hl" = 1 ]; }
+}
+
+# читает файл стратегий $1 в NEW_TP, NEW_UT, NEW_YT, NEW_VER; 1 — файла нет или он битый
+strat_parse() {
+  local kind name params line ver=""
+  NEW_TP=(); NEW_UT=(); NEW_YT=""; NEW_VER=0
+  [ -f "$1" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case $line in ''|'#'*) continue ;; esac
+    case $line in *'|'*) ;; *) return 1 ;; esac
+    kind=${line%%|*}; line=${line#*|}
+    name=${line%%|*}; params=${line#*|}
+    if [ "$kind" = version ]; then
+      case $name in ''|*[!0-9]*) return 1 ;; esac
+      ver=$name; continue
+    fi
+    case $name in ''|*[!A-Za-z0-9_.+-]*) return 1 ;; esac
+    [ "${#name}" -le 20 ] && [ "$name" != "$params" ] || return 1
+    strat_line_ok "$kind" "$params" || return 1
+    case $kind in
+      tpws) NEW_TP+=("$name|$params") ;;
+      ut)   NEW_UT+=("$name|$params") ;;
+      utyt) NEW_YT=$params ;;
+      *)    return 1 ;;
+    esac
+  done < "$1"
+  [ -n "$ver" ] && [ "${#NEW_TP[@]}" -ge 1 ] && [ "${#NEW_UT[@]}" -ge 1 ] && [ -n "$NEW_YT" ] || return 1
+  NEW_VER=$ver
+}
+
+# стратегии из strategies.conf, если он цел; иначе остаются встроенные
+strat_reload() {
+  if strat_parse "$STRAT_FILE"; then
+    STRATEGIES=("${NEW_TP[@]}"); UT_STRAT_D=("${NEW_UT[@]}"); UT_YT=$NEW_YT; STRAT_VER=$NEW_VER
+  fi
+  NSTRAT=${#STRATEGIES[@]}; NUT=${#UT_STRAT_D[@]}
+}
+strat_reload
+
+# номер стратегии по названию из настроек; номер (как хранила 2.x) принимается как есть.
+# Такой стратегии нет — 1 и код возврата 1
+strat_idx() {   # $1 = название или номер, $2 = tpws|ut
+  local i n=$NSTRAT s
+  [ "$2" = ut ] && n=$NUT
+  case $1 in
+    ''|*[!0-9]*) ;;
+    *) [ "$1" -ge 1 ] && [ "$1" -le "$n" ] && { printf '%s' "$1"; return 0; } ;;
+  esac
+  for (( i=1; i<=n; i++ )); do
+    if [ "$2" = ut ]; then s=${UT_STRAT_D[$(( i - 1 ))]}; else s=${STRATEGIES[$(( i - 1 ))]}; fi
+    [ "${s%%|*}" = "$1" ] && { printf '%s' "$i"; return 0; }
+  done
+  printf 1
+  return 1
+}
+
+# 2.x хранила номера стратегий — переводим в названия по встроенному порядку
+cfg_migrate() {
+  local k v s
+  for k in S_Y S_D UT_D; do
+    v=$(cfg "$k")
+    case $v in ''|*[!0-9]*) continue ;; esac
+    [ "$v" -ge 1 ] || continue
+    if [ "$k" = UT_D ]; then s=${BUILTIN_UT[$(( v - 1 ))]}; else s=${BUILTIN_TP[$(( v - 1 ))]}; fi
+    [ -n "$s" ] && cfg_set "$k" "${s%%|*}"
+  done
+}
 
 ut_strat_name() { local s=${UT_STRAT_D[$(( $1 - 1 ))]}; printf '%s' "${s%%|*}"; }
-ut_of() {   # стратегия utunws для Discord из настроек
-  local n
-  n=$(cfg UT_D 1)
-  case $n in ''|*[!0-9]*) n=1 ;; esac
-  { [ "$n" -ge 1 ] && [ "$n" -le "$NUT" ]; } || n=1
-  printf '%s' "$n"
-}
+ut_of() { strat_idx "$(cfg UT_D SEQOVL)" ut; }   # стратегия utunws для Discord из настроек
 yt_engine() { if [ "$(cfg YT tpws)" = utunws ]; then printf utunws; else printf tpws; fi; }
 
 # дописывает в UT_ARGS строку параметров $1, подставляя папку с поддельными пакетами
@@ -276,8 +419,12 @@ build_test_args() {
 }
 
 # ─── что проверяем ───────────────────────────────────────────────────
-# группа|название|адрес. Y — YouTube, D — Discord.
-TARGETS=(
+# группа|название|адрес. Y — YouTube, D — Discord, U — свои сайты (первые USER_MAX из
+# list-user.txt, их добавляет user_targets). Сторож подбирает стратегии, только когда
+# не открываются YouTube или Discord: свой сайт может быть закрыт по адресу, и тогда
+# обход ему не поможет. Для своих сайтов подбор — отдельная команда sites-select.
+USER_MAX=5
+TARGETS_BASE=(
 "D|Discord|https://discord.com/"
 "D|Discord: шлюз|https://gateway.discord.gg/"
 "D|Discord: CDN|https://cdn.discordapp.com/"
@@ -287,11 +434,28 @@ TARGETS=(
 "Y|YouTube: картинки|https://i.ytimg.com/"
 "Y|YouTube: видео|https://redirector.googlevideo.com/report_mapping?di=no"
 )
+TARGETS=("${TARGETS_BASE[@]}")
 NT=${#TARGETS[@]}
+NU=0
 CHECK_LIGHT=0   # 1 — главную YouTube качать сжатой (сторож бережёт трафик)
-CHECK_ONLY=""   # Y или D — проверять только эту группу
+CHECK_ONLY=""   # буквы групп (Y, D, U), которые проверять; пусто — все
 
 t_label() { local l=${1#*|}; printf '%s' "${l%|*}"; }
+t_want() { [ -z "$CHECK_ONLY" ] && return 0; case $CHECK_ONLY in *"${1%%|*}"*) return 0 ;; esac; return 1; }
+
+# свои сайты, если они включены, — в конец TARGETS; результат — TARGETS, NT, NU
+user_targets() {
+  local d
+  TARGETS=("${TARGETS_BASE[@]}"); NU=0
+  if [ "$(cfg USER_SITES 1)" = 1 ] && [ -f "$LISTS/list-user.txt" ]; then
+    while IFS= read -r d || [ -n "$d" ]; do
+      case $d in ''|'#'*|*[!a-z0-9.-]*) continue ;; esac
+      TARGETS+=("U|$d|https://$d/"); NU=$(( NU + 1 ))
+      [ "$NU" -ge "$USER_MAX" ] && break
+    done < "$LISTS/list-user.txt"
+  fi
+  NT=${#TARGETS[@]}
+}
 
 # от чьего имени проверять «как видят программы»: pf заворачивает в tpws всех, кроме root
 probe_user() {
@@ -307,10 +471,11 @@ probe_user() {
 #        apps       — как обычная программа: от имени пользователя, без прокси
 #        utun       — от имени пользователя через физический интерфейс: при включённом
 #                     VPN так видно utunws (правила для этого грузит ut_test_on)
-# результат: LAST_RC[i] (ok|fail|skip), SCORE_Y из NY, SCORE_D из ND, LAST_FAIL
+# результат: LAST_RC[i] (ok|fail|skip), SCORE_Y из NY, SCORE_D из ND, SCORE_U из NU, LAST_FAIL
 run_checks() {
   local how=$1 tmp i t url pu="" pids=() rc
   local -a px comp pre
+  user_targets
   tmp=$(mktemp -d /tmp/zapret-mac-chk.XXXXXX) || return 1
   case $how in
     direct)  [ -n "$PHYS" ] || detect_phys; px=(--noproxy '*'); [ -n "$PHYS" ] && px+=(--interface "$PHYS") ;;
@@ -319,7 +484,7 @@ run_checks() {
     *)       px=(--noproxy '*'); [ "$(id -u)" -eq 0 ] && pu=$(probe_user) ;;
   esac
   for (( i=0; i<NT; i++ )); do
-    [ -n "$CHECK_ONLY" ] && [ "${TARGETS[$i]%%|*}" != "$CHECK_ONLY" ] && continue
+    t_want "${TARGETS[$i]}" || continue
     url=${TARGETS[$i]##*|}
     comp=(--compressed)
     # главную YouTube качаем целиком (~1 МБ): так видно и замедление, а не только блокировку
@@ -333,17 +498,17 @@ run_checks() {
     pids+=($!)
   done
   wait "${pids[@]}" 2>/dev/null
-  SCORE_Y=0; SCORE_D=0; NY=0; ND=0; LAST_FAIL=""; LAST_RC=()
+  SCORE_Y=0; SCORE_D=0; SCORE_U=0; NY=0; ND=0; LAST_FAIL=""; LAST_RC=()
   for (( i=0; i<NT; i++ )); do
     t=${TARGETS[$i]}
     # NY и ND — размер группы целиком, даже если проверяли только другую
-    if [ "${t%%|*}" = Y ]; then NY=$(( NY + 1 )); else ND=$(( ND + 1 )); fi
-    if [ -n "$CHECK_ONLY" ] && [ "${t%%|*}" != "$CHECK_ONLY" ]; then LAST_RC[$i]=skip; continue; fi
+    case ${t%%|*} in Y) NY=$(( NY + 1 )) ;; D) ND=$(( ND + 1 )) ;; esac
+    if ! t_want "$t"; then LAST_RC[$i]=skip; continue; fi
     rc=""
     read -r rc 2>/dev/null < "$tmp/$i"
     if [ "$rc" = 0 ]; then
       LAST_RC[$i]=ok
-      if [ "${t%%|*}" = Y ]; then SCORE_Y=$(( SCORE_Y + 1 )); else SCORE_D=$(( SCORE_D + 1 )); fi
+      case ${t%%|*} in Y) SCORE_Y=$(( SCORE_Y + 1 )) ;; D) SCORE_D=$(( SCORE_D + 1 )) ;; *) SCORE_U=$(( SCORE_U + 1 )) ;; esac
     else
       LAST_RC[$i]=fail
       LAST_FAIL="$LAST_FAIL, $(t_label "$t")"
@@ -351,6 +516,18 @@ run_checks() {
   done
   LAST_FAIL=${LAST_FAIL#, }
   rm -rf "$tmp"
+}
+
+# Стратегию, которая открыла всё, проверяем ещё раз: на нестабильной сети ТСПУ иногда
+# пропускает соединение случайно, и подбор сохранил бы стратегию, которая не работает.
+# Баллы — меньшие из двух проверок. $1 — как проверять (как у run_checks)
+recheck_full() {
+  local y=$SCORE_Y d=$SCORE_D u=$SCORE_U
+  run_checks "$1"
+  [ "$SCORE_Y" -gt "$y" ] && SCORE_Y=$y
+  [ "$SCORE_D" -gt "$d" ] && SCORE_D=$d
+  [ "$SCORE_U" -gt "$u" ] && SCORE_U=$u
+  return 0
 }
 
 print_checks() {
@@ -919,11 +1096,17 @@ ut_apply() {
   return 1
 }
 
+# utunws нужной версии и все поддельные пакеты на месте
+ut_files_ok() {
+  local f
+  [ -x "$UTUNWS" ] && [ "$(cat "$DIR/utunws-version" 2>/dev/null)" = "$UTUNWS_TAG" ] || return 1
+  for f in $UT_FAKES; do [ -f "${UTUNWS%/*}/${f%%:*}" ] || return 1; done
+}
+
 # ставит utunws, если он нужен и его ещё нет; неудача не мешает остальному обходу
 ut_ensure() {
   [ "$(cfg UTUNWS 1)" = 1 ] || return 0
-  [ -x "$UTUNWS" ] && [ -f "${UTUNWS%/*}/tls_clienthello_4pda_to.bin" ] &&
-    [ "$(cat "$DIR/utunws-version" 2>/dev/null)" = "$UTUNWS_TAG" ] && return 0
+  ut_files_ok && return 0
   install_utunws || warn "Discord пойдёт через tpws, как раньше. Повторить установку — пункт 13 «Обновить»."
 }
 
@@ -1088,27 +1271,28 @@ install_tpws() {
 
 install_utunws() {
   local tmp p="ZapretMac.app/Contents/Resources/Payload/bin" f want got
+  local -a names=(utunws)
   mkdir -p "$BIN_DIR" || { err "Не могу создать $BIN_DIR"; return 1; }
   tmp=$(mktemp -d /tmp/zapret-mac-ut.XXXXXX) || return 1
   say "Скачиваю utunws (Flowseal/zapret-mac-discord-youtube $UTUNWS_TAG) с GitHub…"
   if ! curl -fL --progress-bar --connect-timeout 15 -o "$tmp/z.zip" "$UTUNWS_URL"; then
     rm -rf "$tmp"; err "Не удалось скачать $UTUNWS_URL"; return 1
   fi
-  if ! unzip -q -o "$tmp/z.zip" "$p/utunws" "$p/tls_clienthello_www_google_com.bin" "$p/ACTIVE_DISCORD_UDP.bin" \
-         "$p/tls_clienthello_4pda_to.bin" -d "$tmp" 2>/dev/null; then
-    rm -rf "$tmp"; err "В архиве Flowseal нет utunws."; return 1
+  for f in $UT_FAKES; do names+=("${f%%:*}"); done
+  if ! unzip -q -o "$tmp/z.zip" "${names[@]/#/$p/}" -d "$tmp" 2>/dev/null; then
+    rm -rf "$tmp"; err "В архиве Flowseal нет utunws или поддельных пакетов."; return 1
   fi
-  for f in utunws:$UTUNWS_SHA256 tls_clienthello_www_google_com.bin:$FAKE_TLS_SHA256 ACTIVE_DISCORD_UDP.bin:$FAKE_DS_SHA256 \
-           tls_clienthello_4pda_to.bin:$FAKE_4PDA_SHA256; do
+  for f in "utunws:$UTUNWS_SHA256" $UT_FAKES; do
     want=${f#*:}; f=${f%%:*}
     got=$(shasum -a 256 "$tmp/$p/$f" | awk '{print $1}')
     if [ "$got" != "$want" ]; then
       rm -rf "$tmp"; err "Контрольная сумма $f не совпала — файл повреждён или подменён. utunws не установлен."; return 1
     fi
   done
-  install -m 644 -o root -g wheel "$tmp/$p/tls_clienthello_www_google_com.bin" "$tmp/$p/ACTIVE_DISCORD_UDP.bin" \
-    "$tmp/$p/tls_clienthello_4pda_to.bin" "$BIN_DIR/" &&
-    install -m 755 -o root -g wheel "$tmp/$p/utunws" "$UTUNWS.new" && mv -f "$UTUNWS.new" "$UTUNWS"
+  for f in $UT_FAKES; do
+    install -m 644 -o root -g wheel "$tmp/$p/${f%%:*}" "$BIN_DIR/" || { rm -rf "$tmp"; return 1; }
+  done
+  install -m 755 -o root -g wheel "$tmp/$p/utunws" "$UTUNWS.new" && mv -f "$UTUNWS.new" "$UTUNWS"
   xattr -c "$UTUNWS" 2>/dev/null
   rm -rf "$tmp"
   "$UTUNWS" --version >/dev/null 2>&1 || { err "utunws не запускается на этом Mac."; return 1; }
@@ -1117,10 +1301,18 @@ install_utunws() {
 }
 
 self_install() {
-  local me
+  local me src have
   me=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
   if [ -f "$me" ] && [ "$me" != "$SELF" ] && ! cmp -s "$me" "$SELF"; then
     install -m 755 -o root -g wheel "$me" "$SELF" || die "Не могу скопировать скрипт в $DIR"
+  fi
+  # strategies.conf рядом со скриптом (в репозитории, в приложении) — если он новее установленного
+  src="${me%/*}/strategies.conf"
+  if [ "$src" != "$STRAT_FILE" ] && [ -f "$src" ]; then
+    if strat_parse "$STRAT_FILE"; then have=$NEW_VER; else have=0; fi
+    if strat_parse "$src" && [ "$NEW_VER" -gt "$have" ]; then
+      install -m 644 -o root -g wheel "$src" "$STRAT_FILE" && strat_reload
+    fi
   fi
   if [ -n "$SHORTCUT" ] && [ -d "${SHORTCUT%/*}" ] && ! grep -qF "$SELF" "$SHORTCUT" 2>/dev/null; then
     printf '#!/bin/bash\nexec /bin/bash "%s"\n' "$SELF" > "$SHORTCUT" 2>/dev/null && chmod 755 "$SHORTCUT" &&
@@ -1167,6 +1359,7 @@ ensure_installed() {
   [ -f "$LISTS/list-youtube.txt" ] || write_lists
   [ -f "$LISTS/list-exclude-mac.txt" ] || write_mac_exclude
   migrate_v1
+  cfg_migrate
 }
 
 # ─── команды (все, кроме меню и discord, работают от root) ───────────
@@ -1231,28 +1424,43 @@ cmd_stop() {
   pfctl -q -a "$(anchor_test)" -F all >/dev/null 2>&1
   pf_give "$RUN/pf-token"; pf_give "$RUN/pf-token-test"
   proxy_off
-  [ -d "$RUN" ] && printf 'off\n' > "$RUN/status"
+  rm -f "$PAUSE_F" "$RUN/progress"
+  [ -d "$RUN" ] && wd_status off
   log "Выключен"
   ok "Обход выключен, перенаправление и прокси сняты."
 }
 
 # можно ли подбирать стратегии utunws: он включён, установлен целиком и работает прозрачный режим
-ut_selectable() { ut_wanted && [ -f "${UTUNWS%/*}/tls_clienthello_4pda_to.bin" ]; }
+ut_selectable() { ut_wanted && ut_files_ok; }
 
-# одна строка подбора: $1 — номер, $2 — из скольких, $3 — название, дальше — что показать (Y, D)
+# одна строка подбора: $1 — номер, $2 — из скольких, $3 — название, дальше — что показать (Y, D, U)
 sel_line() {
   local i=$1 n=$2 name=$3 g
   shift 3
   printf ' [%2d/%d] %-10s' "$i" "$n" "$name"
   for g in "$@"; do
-    if [ "$g" = Y ]; then printf ' YouTube %s' "$(score_mark "$SCORE_Y" "$NY")"
-    else printf ' Discord %s' "$(score_mark "$SCORE_D" "$ND")"; fi
+    case $g in
+      Y) printf ' YouTube %s' "$(score_mark "$SCORE_Y" "$NY")" ;;
+      D) printf ' Discord %s' "$(score_mark "$SCORE_D" "$ND")" ;;
+      U) [ "$NU" -gt 0 ] && printf ' свои сайты %s' "$(score_mark "$SCORE_U" "$NU")" ;;
+    esac
   done
   [ -n "$LAST_FAIL" ] && printf '  %sне открылось: %s%s' "$D" "$LAST_FAIL" "$N"
   printf '\n'
 }
 
-# Подбор стратегий. $1 = all — прогнать все; auto — для сторожа: сначала проверить текущие.
+# ход подбора для приложения, файл $RUN/progress: «проценты|что сейчас|кто подбирает».
+# PROG_T — сколько шагов всего, prog — следующий шаг
+PROG_K=0; PROG_T=1
+prog() {
+  PROG_K=$(( PROG_K + 1 ))
+  [ -w "$RUN" ] || return 0
+  printf '%s|%s|%s\n' "$(( PROG_K * 100 / PROG_T ))" "$1" "${SEL_WHO:-cli}" > "$RUN/progress.new" &&
+    chmod 644 "$RUN/progress.new" && mv -f "$RUN/progress.new" "$RUN/progress"
+}
+prog_done() { [ -w "$RUN" ] && rm -f "$RUN/progress"; return 0; }
+
+# Подбор стратегий. $1 = all — прогнать все; auto — сначала проверить текущие.
 # С utunws Discord подбирается среди стратегий utunws, YouTube — среди стратегий tpws, а если
 # tpws открывает не всё, ещё и через utunws. Без utunws обе группы подбираются через tpws.
 # Результат: SEL_Y, SEL_STY — лучшая стратегия tpws для YouTube и её балл; SEL_YT — tpws|utunws;
@@ -1262,13 +1470,17 @@ select_strategies() {
   local i by bd ud yt sy=-1 sd=-1 tsy=-1 bind="" ut=0 only=""
   SEL_PATH=0
   test_env_up || return 1
-  trap 'stop_test; ut_try_stop; test_env_down; exit 130' INT TERM HUP
+  trap 'stop_test; ut_try_stop; test_env_down; prog_done; exit 130' INT TERM HUP
   [ -n "$TEST_VPN" ] && bind=$PHYS_IP
   ut_selectable && { ut=1; only=Y; }
   by=$(strat_of Y); bd=$(strat_of D); ud=$(ut_of); yt=tpws
   [ "$ut" = 1 ] && yt=$(yt_engine)
+  PROG_K=0; PROG_T=$(( 1 + NSTRAT ))
+  [ "$1" = auto ] && PROG_T=$(( PROG_T + 1 ))
+  [ "$ut" = 1 ] && PROG_T=$(( PROG_T + NUT + 1 ))
   say ""
   say "${B}Без обхода${N} ${D}(напрямую через $PHYS)${N}"
+  prog "Проверяю сеть без обхода"
   CHECK_ONLY=""; run_checks direct
   print_checks
   if [ "$SCORE_Y" -eq "$NY" ] && [ "$SCORE_D" -eq "$ND" ]; then
@@ -1276,15 +1488,17 @@ select_strategies() {
   fi
   if [ "$1" = auto ]; then
     # текущие стратегии: если всё открывается, сломался не обход, а перенаправление
+    prog "Проверяю сохранённые стратегии"
     if [ "$ut" = 1 ]; then
       if ut_try_start "$ud" "$([ "$yt" = utunws ] && echo 1)"; then
-        CHECK_ONLY=D; [ "$yt" = utunws ] && CHECK_ONLY=""
+        CHECK_ONLY=D; [ "$yt" = utunws ] && CHECK_ONLY=YD
         run_checks direct; ut_try_stop
         sd=$SCORE_D; [ "$yt" = utunws ] && { sy=$SCORE_Y; tsy=0; }
       fi
     fi
     if [ "$yt" = tpws ] && start_test cur "$bind"; then
-      CHECK_ONLY=$only; run_checks "socks:$TEST_PORT"; stop_test
+      CHECK_ONLY=$only; [ -n "$only" ] || CHECK_ONLY=YD
+      run_checks "socks:$TEST_PORT"; stop_test
       sy=$SCORE_Y; tsy=$sy; [ "$ut" = 1 ] || sd=$SCORE_D
     fi
     CHECK_ONLY=""
@@ -1292,7 +1506,7 @@ select_strategies() {
     if [ "$sy" -eq "$NY" ] && [ "$sd" -eq "$ND" ]; then
       SEL_PATH=1; SEL_Y=$by; SEL_STY=$tsy; SEL_YT=$yt; SEL_SY=$sy; SEL_UT=$ut; SEL_SD=$sd
       if [ "$ut" = 1 ]; then SEL_D=$ud; else SEL_D=$bd; fi
-      test_env_down; trap - INT TERM HUP
+      test_env_down; prog_done; trap - INT TERM HUP
       return 0
     fi
     sy=-1; sd=-1; tsy=-1
@@ -1301,12 +1515,16 @@ select_strategies() {
   say ""
   if [ "$ut" = 1 ]; then say "${B}YouTube через tpws${N} ${D}(до 10 секунд на стратегию)${N}"
   else say "${B}YouTube и Discord через tpws${N} ${D}(до 10 секунд на стратегию)${N}"; fi
+  [ -n "$only" ] || only=YD
   for (( i=1; i<=NSTRAT; i++ )); do
+    prog "tpws: $(strat_name "$i") — $i из $NSTRAT"
     if ! start_test "$i" "$bind"; then
       printf ' [%2d/%d] %-10s не запустилась\n' "$i" "$NSTRAT" "$(strat_name "$i")"
       continue
     fi
-    CHECK_ONLY=$only; run_checks "socks:$TEST_PORT"; stop_test; CHECK_ONLY=""
+    CHECK_ONLY=$only; run_checks "socks:$TEST_PORT"
+    [ "$SCORE_Y" -eq "$NY" ] && recheck_full "socks:$TEST_PORT"
+    stop_test; CHECK_ONLY=""
     if [ "$ut" = 1 ]; then sel_line "$i" "$NSTRAT" "$(strat_name "$i")" Y
     else sel_line "$i" "$NSTRAT" "$(strat_name "$i")" Y D; fi
     [ "$SCORE_Y" -gt "$tsy" ] && { by=$i; tsy=$SCORE_Y; }
@@ -1316,14 +1534,18 @@ select_strategies() {
   sy=$tsy; yt=tpws
 
   if [ "$ut" = 1 ]; then
+    PROG_K=$(( 1 + NSTRAT )); [ "$1" = auto ] && PROG_K=$(( PROG_K + 1 ))   # tpws мог закончить раньше
     say ""
     say "${B}Discord через utunws${N}"
     for (( i=1; i<=NUT; i++ )); do
+      prog "utunws для Discord: $(ut_strat_name "$i") — $i из $NUT"
       if ! ut_try_start "$i"; then
         printf ' [%2d/%d] %-10s не запустилась\n' "$i" "$NUT" "$(ut_strat_name "$i")"
         continue
       fi
-      CHECK_ONLY=D; run_checks direct; ut_try_stop; CHECK_ONLY=""
+      CHECK_ONLY=D; run_checks direct
+      [ "$SCORE_D" -eq "$ND" ] && recheck_full direct
+      ut_try_stop; CHECK_ONLY=""
       sel_line "$i" "$NUT" "$(ut_strat_name "$i")" D
       [ "$SCORE_D" -gt "$sd" ] && { ud=$i; sd=$SCORE_D; }
       [ "$1" != all ] && [ "$sd" -eq "$ND" ] && break
@@ -1331,6 +1553,7 @@ select_strategies() {
     if [ "$1" = all ] || [ "$tsy" -lt "$NY" ]; then
       say ""
       say "${B}YouTube через utunws${N}"
+      prog "utunws для YouTube"
       if ut_try_start "$ud" 1; then
         CHECK_ONLY=Y; run_checks direct; ut_try_stop; CHECK_ONLY=""
         sel_line 1 1 HOSTFAKESPLIT Y
@@ -1341,10 +1564,47 @@ select_strategies() {
     fi
   fi
   test_env_down
+  prog_done
   trap - INT TERM HUP
   SEL_Y=$by; SEL_STY=$tsy; SEL_YT=$yt; SEL_SY=$sy; SEL_UT=$ut; SEL_SD=$sd
   if [ "$ut" = 1 ]; then SEL_D=$ud; else SEL_D=$bd; fi
   [ "$sy" -ge 0 ] || [ "$sd" -ge 0 ]
+}
+
+# Подбор стратегии tpws для своих сайтов (S_D). Когда Discord идёт через tpws (без utunws),
+# у него та же стратегия — тогда смотрим на Discord и свои сайты вместе, и Discord важнее.
+# Результат: SEL_D, SEL_SU — стратегия и сколько своих сайтов с ней открылось
+sites_select() {
+  local i best key bk=-1 bind="" only=U
+  user_targets
+  [ "$NU" -gt 0 ] || { err "Своих сайтов нет или они выключены."; return 1; }
+  test_env_up || return 1
+  trap 'stop_test; test_env_down; prog_done; exit 130' INT TERM HUP
+  [ -n "$TEST_VPN" ] && bind=$PHYS_IP
+  ut_active || only=DU
+  best=$(strat_of D); SEL_SU=-1
+  PROG_K=0; PROG_T=$NSTRAT
+  say ""
+  say "${B}Свои сайты через tpws${N} ${D}(до 10 секунд на стратегию)${N}"
+  for (( i=1; i<=NSTRAT; i++ )); do
+    prog "Свои сайты: $(strat_name "$i") — $i из $NSTRAT"
+    if ! start_test "$i" "$bind"; then
+      printf ' [%2d/%d] %-10s не запустилась\n' "$i" "$NSTRAT" "$(strat_name "$i")"
+      continue
+    fi
+    CHECK_ONLY=$only; run_checks "socks:$TEST_PORT"
+    [ "$SCORE_U" -eq "$NU" ] && recheck_full "socks:$TEST_PORT"
+    stop_test; CHECK_ONLY=""
+    if [ "$only" = U ]; then sel_line "$i" "$NSTRAT" "$(strat_name "$i")" U; key=$SCORE_U
+    else sel_line "$i" "$NSTRAT" "$(strat_name "$i")" D U; key=$(( SCORE_D * 10 + SCORE_U )); fi
+    [ "$key" -gt "$bk" ] && { best=$i; bk=$key; SEL_SU=$SCORE_U; }
+    [ "$SCORE_U" -eq "$NU" ] && { [ "$only" = U ] || [ "$SCORE_D" -eq "$ND" ]; } && break
+  done
+  test_env_down
+  prog_done
+  trap - INT TERM HUP
+  SEL_D=$best
+  [ "$SEL_SU" -gt 0 ]
 }
 
 report_group() {   # $1 = название, $2 = что выбрано, $3 = балл, $4 = из скольких
@@ -1352,18 +1612,82 @@ report_group() {   # $1 = название, $2 = что выбрано, $3 = б�
   else warn "$1: лучшее — $2: $3 из $4. Часть может не работать."; fi
 }
 
-# сохраняет итог подбора в настройки
+# сохраняет итог подбора в настройки (названиями стратегий) и запоминает для этой сети
 sel_save() {
-  [ "$SEL_STY" -gt 0 ] && cfg_set S_Y "$SEL_Y"
+  [ "$SEL_STY" -gt 0 ] && cfg_set S_Y "$(strat_name "$SEL_Y")"
   [ "$SEL_UT" = 1 ] && [ "$SEL_SY" -gt 0 ] && cfg_set YT "$SEL_YT"
   if [ "$SEL_SD" -gt 0 ]; then
-    if [ "$SEL_UT" = 1 ]; then cfg_set UT_D "$SEL_D"; else cfg_set S_D "$SEL_D"; fi
+    if [ "$SEL_UT" = 1 ]; then cfg_set UT_D "$(ut_strat_name "$SEL_D")"; else cfg_set S_D "$(strat_name "$SEL_D")"; fi
   fi
+  { [ "$SEL_SY" -gt 0 ] || [ "$SEL_SD" -gt 0 ]; } && net_save
+  return 0
 }
 
 # что сейчас выбрано, для сообщений
 yt_desc() { if [ "$(yt_engine)" = utunws ] && ut_wanted; then printf 'utunws'; else printf 'tpws, %s' "$(strat_name "$(strat_of Y)")"; fi; }
 ds_desc() { if ut_wanted; then printf 'utunws, %s' "$(ut_strat_name "$(ut_of)")"; else printf 'tpws, %s' "$(strat_name "$(strat_of D)")"; fi; }
+us_desc() { printf 'tpws, %s' "$(strat_name "$(strat_of D)")"; }
+
+# ─── стратегии для каждой сети ───────────────────────────────────────
+# Сеть узнаём по MAC шлюза: у домашнего роутера и у iPhone с раздачей он свой, даже
+# если адреса совпадают. В $NETS/<id> — стратегии, которые в этой сети сработали.
+NET_KEYS="S_Y S_D UT_D YT"
+
+net_id() {   # → NET_ID, NET_LABEL; 1 — сети нет
+  local mac kind
+  NET_ID=""; NET_LABEL=""
+  detect_phys || return 1
+  mac=$(arp -n "$PHYS_GW" 2>/dev/null | awk '/ at / {print $4; exit}')
+  case $mac in
+    *:*:*:*:*:*) NET_ID=$(printf '%s' "$mac" | tr -d ':' | tr '[:upper:]' '[:lower:]') ;;
+    *) NET_ID="${PHYS}_$(printf '%s' "$PHYS_GW" | tr '.' '_')" ;;
+  esac
+  case $NET_ID in *[!a-z0-9_]*) return 1 ;; esac
+  kind=$(networksetup -listallhardwareports 2>/dev/null |
+         awk -v d="$PHYS" '/^Hardware Port:/ {sub(/^Hardware Port: /, ""); p=$0} /^Device:/ && $2==d {print p; exit}')
+  [ "$PHYS_GW" = 172.20.10.1 ] && kind="iPhone"   # так раздаёт интернет любой iPhone
+  NET_LABEL="${kind:-$PHYS} · $PHYS_GW"
+}
+
+net_save() {
+  local k
+  net_id || return 0
+  mkdir -p "$NETS" 2>/dev/null && [ -w "$NETS" ] || return 0
+  { printf 'LABEL=%s\n' "$NET_LABEL"
+    for k in $NET_KEYS; do printf '%s=%s\n' "$k" "$(cfg "$k")"; done
+    printf 'SAVED=%s\n' "$(date +%s)"
+  } > "$NETS/$NET_ID.new" && chmod 644 "$NETS/$NET_ID.new" && mv -f "$NETS/$NET_ID.new" "$NETS/$NET_ID"
+}
+
+# ставит в настройки стратегии, запомненные для этой сети; 0 — что-то поменялось
+net_load() {
+  local f k v rc=1
+  net_id || return 1
+  f="$NETS/$NET_ID"
+  [ -f "$f" ] || return 1
+  for k in $NET_KEYS; do
+    v=$(sed -n "s/^$k=//p" "$f" | tail -n 1)
+    case $v in ''|*[!A-Za-z0-9_.+-]*) continue ;; esac
+    [ "$v" != "$(cfg "$k")" ] && { cfg_set "$k" "$v"; rc=0; }
+  done
+  return $rc
+}
+
+# сеть сменилась — перезапускаем то, чьи стратегии поменялись из-за net_load
+net_apply() {
+  local old_tp old_ut
+  old_tp="$(strat_of Y) $(strat_of D)"; old_ut="$(ut_of) $(yt_engine)"
+  net_load || return 0
+  log "Сеть «$NET_LABEL» знакома — ставлю её стратегии: YouTube — $(yt_desc), Discord — $(ds_desc)"
+  if [ "$old_tp" != "$(strat_of Y) $(strat_of D)" ]; then
+    tpws_apply "$(cfg MODE transparent)" >/dev/null 2>&1 || log "tpws не запустился со стратегиями этой сети"
+  fi
+  if [ "$old_ut" != "$(ut_of) $(yt_engine)" ] && [ -f "$PL_UT" ]; then
+    fw_loaded && fw_on >/dev/null 2>&1   # YouTube мог уйти из utunws — сначала правила
+    ut_apply >/dev/null 2>&1 || log "utunws не запустился со стратегиями этой сети"
+    fw_loaded && fw_on >/dev/null 2>&1
+  fi
+}
 
 cmd_test() {   # $1 = all — прогнать все, иначе остановиться, когда нашлись рабочие для обоих
   ensure_installed
@@ -1417,7 +1741,7 @@ cmd_choose() {
     *[!0-9]*) err "Нет такой стратегии"; return ;;
     *) { [ "$n" -ge 1 ] && [ "$n" -le "$NSTRAT" ]; } || { err "Нет такой стратегии"; return; }; d=$n ;;
   esac
-  cfg_set S_Y "$y"; cfg_set S_D "$d"
+  cfg_set S_Y "$(strat_name "$y")"; cfg_set S_D "$(strat_name "$d")"
   if ut_selectable; then cmd_choose_ut || return; fi
   cmd_start
 }
@@ -1446,7 +1770,7 @@ cmd_choose_ut() {
     t|T|т|Т|tpws) yt=tpws ;;
     u|U|г|Г|utunws) yt=utunws ;;
   esac
-  cfg_set UT_D "$u"; cfg_set YT "$yt"
+  cfg_set UT_D "$(ut_strat_name "$u")"; cfg_set YT "$yt"
 }
 
 cmd_check() {
@@ -1760,10 +2084,16 @@ cmd_update() {
   fi
   # utunws обновляется вместе со скриптом: версия и контрольные суммы зашиты в него
   if [ "$(cfg UTUNWS 1)" = 1 ]; then
-    if [ -x "$UTUNWS" ] && [ -f "${UTUNWS%/*}/tls_clienthello_4pda_to.bin" ] &&
-       [ "$(cat "$DIR/utunws-version" 2>/dev/null)" = "$UTUNWS_TAG" ]; then ok "utunws $UTUNWS_TAG на месте"
+    if ut_files_ok; then ok "utunws $UTUNWS_TAG на месте"
     else install_utunws || warn "utunws не обновлён — Discord пойдёт через tpws."; fi
   fi
+  lists_update
+  [ -f "$PL_TPWS" ] && cmd_start
+  return 0
+}
+
+# tpws сам перечитывает изменившиеся списки — перезапускать его не нужно
+lists_update() {
   say "Обновляю списки доменов Flowseal…"
   if fetch_list list-google.txt "$LISTS/list-youtube.txt" "$HDR_YT" &&
      fetch_list list-general.txt "$LISTS/list-general.txt" "$HDR_GEN" &&
@@ -1771,22 +2101,23 @@ cmd_update() {
     ok "Списки обновлены"
   else
     warn "Списки не скачались целиком — оставил прежние"
+    return 1
   fi
-  [ -f "$PL_TPWS" ] && cmd_start
-  return 0
 }
 
-cmd_uninstall() {
-  local a
-  printf 'Удалить zapret-mac полностью? [y/N] '
-  read -r a
-  case $a in y|Y|д|Д|yes|да) ;; *) return ;; esac
+cmd_uninstall() {   # $1 = yes — не спрашивать (из приложения)
+  local a=${1:-}
+  if [ "$a" != yes ]; then
+    printf 'Удалить zapret-mac полностью? [y/N] '
+    read -r a
+    case $a in y|Y|д|Д|yes|да) ;; *) return ;; esac
+  fi
   cmd_stop
   [ -f "$DNS_BACKUP" ] && cmd_dns
   pf_conf_unpatch
   migrate_v1 >/dev/null 2>&1
   rm -rf "$DIR"
-  rm -f "$PL_TPWS" "$PL_WD" "$PL_UT"
+  rm -f "$PL_TPWS" "$PL_WD" "$PL_UT" "$SUDOERS"
   if [ -n "$RHOME" ] && [ -f "$(ds_agent)" ]; then
     launchctl bootout "gui/$(id -u "$RUSER")/$LBL_DS" >/dev/null 2>&1
     rm -f "$(ds_agent)"
@@ -1795,17 +2126,348 @@ cmd_uninstall() {
   ok "zapret-mac удалён. Сеть вернулась к обычным настройкам."
 }
 
+# ─── команды для приложения в строке меню ────────────────────────────
+# Приложение Zapret запускает их через sudo -n (правило ставит gui-install) и показывает
+# их вывод, пока они работают. Состояние читает командой info — она работает без root.
+
+# Включить. В знакомой сети сначала ставим её стратегии; сохранённые проверяются за
+# секунды, полный подбор — только если они не открывают YouTube или Discord
+cmd_on() {
+  ensure_installed
+  rm -f "$PAUSE_F"
+  [ "$(cfg MODE transparent)" = transparent ] && ut_ensure
+  net_load && say "Сеть «$NET_LABEL» знакома — начинаю с её стратегий."
+  SEL_WHO=gui
+  if select_strategies auto; then
+    say ""
+    if [ "$SEL_PATH" = 1 ]; then
+      ok "Сохранённые стратегии работают."
+      net_save
+    elif [ "$SEL_SY" -le 0 ] && [ "$SEL_SD" -le 0 ]; then
+      warn "Ни одна стратегия не помогла — включаю с прежними. Что попробовать: DNS Google/Cloudflare, другая сеть, VPN."
+    else
+      sel_save
+      if [ "$SEL_SY" -gt 0 ]; then report_group YouTube "$(yt_desc)" "$SEL_SY" "$NY"; fi
+      if [ "$SEL_SD" -gt 0 ]; then report_group Discord "$(ds_desc)" "$SEL_SD" "$ND"; fi
+    fi
+    log "Подбор: YouTube — $(yt_desc) ($SEL_SY/$NY), Discord — $(ds_desc) ($SEL_SD/$ND)"
+  else
+    warn "Подобрать стратегии сейчас не получилось — включаю с сохранёнными, сторож проверит их сам."
+  fi
+  cmd_start
+}
+
+cmd_pause() {   # $1 = на сколько минут, 0 — пока не снимут
+  local m=${1:-0} u=0
+  case $m in ''|*[!0-9]*) die "Укажи минуты: pause 15 (0 — пока не снимешь)" ;; esac
+  [ -f "$PL_WD" ] || die "Обход выключен — ставить на паузу нечего."
+  [ "$m" -gt 0 ] && u=$(( $(date +%s) + m * 60 ))
+  printf '%s\n' "$u" > "$PAUSE_F" && chmod 644 "$PAUSE_F" || die "Не могу записать $PAUSE_F"
+  # снимаем сразу, не дожидаясь сторожа; соединения, завёрнутые в tpws, сбрасываем
+  if [ "$(cfg MODE transparent)" = transparent ]; then
+    fw_loaded && { fw_off; launchctl kickstart -k "system/$LBL_TPWS" >/dev/null 2>&1; }
+  else
+    proxy_off
+  fi
+  wd_status paused "$u"
+  if [ "$u" = 0 ]; then ok "Пауза — обход снят, пока не снимешь паузу."; else ok "Пауза до $(date -r "$u" '+%H:%M')."; fi
+}
+
+cmd_resume() {
+  local v
+  [ -f "$PAUSE_F" ] || { ok "Паузы нет."; return 0; }
+  rm -f "$PAUSE_F"
+  if v=$(vpn_iface); then
+    wd_status vpn "$v $(vpn_app)"
+    ok "Пауза снята. Сейчас включён VPN — обход вернётся, когда его выключишь."
+    return 0
+  fi
+  if [ "$(cfg MODE transparent)" = transparent ]; then fw_on >/dev/null 2>&1; else proxy_on >/dev/null 2>&1; fi
+  wd_status direct
+  : > "$RUN/check-soon"
+  ok "Пауза снята — обход снова работает."
+}
+
+# свои сайты в обходе или нет: список остаётся, меняется только то, получает ли его tpws
+cmd_sites() {
+  case ${1:-} in on) cfg_set USER_SITES 1 ;; off) cfg_set USER_SITES 0 ;; *) die "sites on|off" ;; esac
+  if [ -f "$PL_TPWS" ]; then tpws_apply "$(cfg MODE transparent)" || return 1; fi
+  if [ "$1" = on ]; then ok "Свои сайты идут через обход."; else ok "Свои сайты идут напрямую."; fi
+  log "Свои сайты: $([ "$1" = on ] && echo включены || echo выключены)"
+}
+
+# «https://www.Example.com/path» → «example.com»
+dom_norm() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' |
+    sed -E 's|^[a-z][a-z0-9+.-]*://||; s|[/:?#].*$||; s|^www\.||; s|[[:space:]]||g; s|\.$||'
+}
+dom_ok() {
+  case $1 in ''|*[!a-z0-9.-]*|.*|*.|*..*|-*|*.-*|*-.*) return 1 ;; esac
+  case $1 in *.*) [ "${#1}" -le 253 ] ;; *) return 1 ;; esac
+}
+
+# домены — в list-user.txt; поддомены tpws учитывает сам, перезапуск не нужен
+cmd_site_add() {
+  local d f="$LISTS/list-user.txt" added=""
+  ensure_installed
+  [ $# -gt 0 ] || die "Укажи домен: site-add example.com"
+  [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ] && printf '\n' >> "$f"
+  for d in "$@"; do
+    d=$(dom_norm "$d")
+    if ! dom_ok "$d"; then err "Это не похоже на домен: $d"; continue; fi
+    if grep -qxF "$d" "$f" 2>/dev/null; then ok "$d уже в своих сайтах"; continue; fi
+    grep -qxF "$d" "$LISTS/list-exclude.txt" "$LISTS/list-exclude-mac.txt" "$LISTS/list-exclude-user.txt" 2>/dev/null &&
+      warn "$d в списке исключений — обход его не тронет, пока он там"
+    printf '%s\n' "$d" >> "$f"
+    added="$added $d"
+    ok "$d добавлен вместе с поддоменами"
+  done
+  [ -n "$added" ] && log "Свои сайты: добавлены$added"
+  return 0
+}
+
+cmd_site_del() {
+  local d f="$LISTS/list-user.txt" tmp
+  for d in "$@"; do
+    d=$(dom_norm "$d")
+    dom_ok "$d" && grep -qxF "$d" "$f" 2>/dev/null || continue
+    tmp=$(mktemp /tmp/zapret-mac-ul.XXXXXX) || return 1
+    grep -vxF "$d" "$f" > "$tmp"; cat "$tmp" > "$f"; rm -f "$tmp"
+    ok "$d убран из своих сайтов"
+    log "Свои сайты: убран $d"
+  done
+  return 0
+}
+
+cmd_sites_select() {
+  ensure_installed
+  SEL_WHO=gui
+  if ! sites_select; then
+    warn "Ни одна стратегия не открыла свои сайты. Возможно, они закрыты по адресу — тогда поможет только VPN."
+    return 1
+  fi
+  cfg_set S_D "$(strat_name "$SEL_D")"
+  net_save
+  say ""
+  report_group "Свои сайты" "$(us_desc)" "$SEL_SU" "$NU"
+  log "Подбор для своих сайтов: $(us_desc), $SEL_SU/$NU"
+  [ -f "$PL_TPWS" ] && tpws_apply "$(cfg MODE transparent)"
+  return 0
+}
+
+cmd_dns_set() {   # on|off
+  case ${1:-} in
+    on)  [ -f "$DNS_BACKUP" ] && { ok "DNS уже Google/Cloudflare."; return 0; } ;;
+    off) [ -f "$DNS_BACKUP" ] || { ok "DNS и так как был."; return 0; } ;;
+    *)   die "dns on|off" ;;
+  esac
+  cmd_dns
+  log "DNS: $([ "$1" = on ] && echo Google/Cloudflare || echo как был)"
+}
+
+# итог проверки для приложения — $RUN/check; $1 = через что проверяли: bypass|vpn|direct
+check_save() {
+  local i
+  [ -w "$RUN" ] || return 0
+  { printf 'check_time=%s\ncheck_via=%s\n' "$(date +%s)" "$1"
+    for (( i=0; i<NT; i++ )); do
+      [ "${LAST_RC[$i]}" = skip ] || printf 'chk=%s|%s|%s\n' "${LAST_RC[$i]}" "${TARGETS[$i]%%|*}" "$(t_label "${TARGETS[$i]}")"
+    done
+  } > "$RUN/check.new" && chmod 644 "$RUN/check.new" && mv -f "$RUN/check.new" "$RUN/check"
+}
+check_line() {   # «YouTube 3/3 · Discord 5/5 · свои сайты 1/2 — не открылось: …»
+  local s="YouTube $SCORE_Y/$NY · Discord $SCORE_D/$ND"
+  [ "$NU" -gt 0 ] && s="$s · свои сайты $SCORE_U/$NU"
+  [ -n "$LAST_FAIL" ] && s="$s — не открылось: $LAST_FAIL"
+  printf '%s' "$s"
+}
+
+# проверка в журнал: как сайты открываются у программ прямо сейчас
+cmd_check_now() {
+  local via=bypass what="через обход"
+  if [ ! -f "$PL_TPWS" ] || paused; then via=direct; what="без обхода"
+  elif vpn_iface >/dev/null; then via=vpn; what="через VPN"; fi
+  if [ "$via" = bypass ] && [ "$(cfg MODE transparent)" = socks ]; then run_checks "socks:$SOCKS_PORT"; else run_checks apps; fi
+  print_checks
+  check_save "$via"
+  log "Проверка $what: $(check_line)"
+}
+
+# параметры, с которыми сейчас запущены бы tpws и utunws, — одной строкой
+run_args() {
+  build_main_args "$(cfg MODE transparent)"
+  build_ut_args "$(ut_of)" "$([ "$(yt_engine)" = utunws ] && echo 1)"
+  printf '%s\n%s' "${ARGS[*]}" "${UT_ARGS[*]}"
+}
+
+# tpws и utunws должны принять каждую стратегию из NEW_TP, NEW_UT, NEW_YT
+strat_dry() {
+  (
+    STRATEGIES=("${NEW_TP[@]}"); UT_STRAT_D=("${NEW_UT[@]}"); UT_YT=$NEW_YT
+    NSTRAT=${#STRATEGIES[@]}; NUT=${#UT_STRAT_D[@]}
+    for (( i=1; i<=NSTRAT; i++ )); do
+      build_test_args "$i" ""
+      "$TPWS" "${ARGS[@]}" --dry-run >/dev/null 2>&1 || { err "tpws не принял стратегию $(strat_name "$i")"; exit 1; }
+    done
+    [ -x "$UTUNWS" ] || exit 0
+    for (( i=1; i<=NUT; i++ )); do
+      for y in "" 1; do
+        build_ut_args "$i" "$y"
+        "$UTUNWS" "${UT_ARGS[@]}" --dry-run >/dev/null 2>&1 || { err "utunws не принял стратегию $(ut_strat_name "$i")"; exit 1; }
+      done
+    done
+  )
+}
+
+# Свежие стратегии с GitHub и списки Flowseal. Из приложения — кнопка «Обновить
+# стратегии», из сторожа — раз в сутки ($1 = auto). tpws и utunws перезапускаются,
+# только если поменялись параметры, с которыми они работают
+cmd_update_strategies() {
+  local tmp before after changed=0 rc res lists=0
+  mkdir -p "$RUN"
+  mkdir "$RUN/update.lock" 2>/dev/null || { err "Обновление уже идёт."; return 1; }
+  [ "${1:-}" = auto ] && say "$(date '+%d.%m %H:%M:%S') обновление раз в сутки"
+  say "Скачиваю стратегии с GitHub…"
+  tmp=$(mktemp /tmp/zapret-mac-strat.XXXXXX) || { rmdir "$RUN/update.lock"; return 1; }
+  curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp" "$STRAT_URL" 2>/dev/null; rc=$?
+  if [ "$rc" = 22 ]; then
+    res="на GitHub нет файла стратегий — остались версии $STRAT_VER"
+  elif [ "$rc" != 0 ]; then
+    res="GitHub не ответил — остались стратегии версии $STRAT_VER"
+  elif ! strat_parse "$tmp"; then
+    res="файл стратегий с GitHub не прошёл проверку — остались версии $STRAT_VER"
+  elif [ "$NEW_VER" -le "$STRAT_VER" ]; then
+    res="стратегии актуальны (версия $STRAT_VER)"; changed=-1
+  elif ! strat_dry; then
+    res="новые стратегии не подошли tpws или utunws — остались версии $STRAT_VER"
+  else
+    before=$(run_args)
+    if install -m 644 -o root -g wheel "$tmp" "$STRAT_FILE"; then
+      strat_reload
+      changed=1
+      res="стратегии обновлены до версии $STRAT_VER"
+    else
+      res="не смог записать $STRAT_FILE"
+    fi
+  fi
+  rm -f "$tmp"
+  lists_update && lists=1
+  date +%s > "$RUN/strat-updated" && chmod 644 "$RUN/strat-updated"
+  if [ "$changed" = 1 ]; then
+    log "Стратегии обновлены до версии $STRAT_VER"
+    notify "Стратегии обновлены до версии $STRAT_VER"
+    after=$(run_args)
+    if [ -f "$PL_TPWS" ] && [ "$before" != "$after" ]; then
+      say "Параметры текущих стратегий поменялись — перезапускаю обход."
+      tpws_apply "$(cfg MODE transparent)" || log "tpws не запустился с новыми стратегиями"
+      if [ -f "$PL_UT" ]; then
+        fw_loaded && fw_on >/dev/null 2>&1
+        ut_apply || log "utunws не запустился с новыми стратегиями"
+        fw_loaded && fw_on >/dev/null 2>&1
+      fi
+      : > "$RUN/check-soon"   # сторож скоро проверит, открываются ли сайты
+    fi
+  fi
+  rmdir "$RUN/update.lock" 2>/dev/null
+  # одна итоговая строка — её приложение показывает как сообщение
+  if [ "$lists" = 1 ]; then res="$res, списки обновлены"; else res="$res, списки не скачались"; fi
+  if [ "$changed" = 0 ] || [ "$lists" = 0 ]; then warn "$res"; else ok "$res"; fi
+  return 0
+}
+
+# состояние для приложения строками «ключ=значение»; работает и без root
+cmd_info() {
+  local st v vi
+  printf 'version=%s\n' "$ZM_VERSION"
+  if [ ! -f "$PL_TPWS" ]; then st=off
+  elif ! pgrep -f "$SELF daemon" >/dev/null 2>&1; then st=nowd
+  elif wd_read_state; then st=$WD_ST
+  else st=starting; fi
+  printf 'state=%s\n' "$st"
+  printf 'since=%s\n' "$(stat -f %m "$RUN/status" 2>/dev/null)"
+  v=""; [ -f "$RUN/status" ] && read -r _ v < "$RUN/status"
+  case $st in
+    vpn)    vi=${v%% *}; v=${v#"$vi"}; printf 'vpn=%s\nvpn_app=%s\n' "$vi" "${v# }" ;;
+    paused) printf 'pause_until=%s\n' "${v:-0}" ;;
+  esac
+  printf 'mode=%s\n' "$(cfg MODE transparent)"
+  printf 'yt=%s\nds=%s\nus=%s\n' "$(yt_desc)" "$(ds_desc)" "$(us_desc)"
+  printf 'user_sites=%s\n' "$(cfg USER_SITES 1)"
+  printf 'dns=%s\n' "$([ -f "$DNS_BACKUP" ] && echo 1 || echo 0)"
+  printf 'strat_ver=%s\nstrat_updated=%s\n' "$STRAT_VER" "$(cat "$RUN/strat-updated" 2>/dev/null)"
+  printf 'tpws_ver=%s\nutunws_ver=%s\nutunws_up=%s\n' "$(cat "$DIR/zapret-version" 2>/dev/null)" \
+    "$(cat "$DIR/utunws-version" 2>/dev/null)" "$(ut_up && echo 1 || echo 0)"
+  net_id && printf 'net=%s\nnet_known=%s\n' "$NET_LABEL" "$([ -f "$NETS/$NET_ID" ] && echo 1 || echo 0)"
+  [ -f "$RUN/progress" ] && printf 'progress=%s\n' "$(cat "$RUN/progress")"
+  [ -f "$RUN/check" ] && cat "$RUN/check"
+  return 0
+}
+
+# Из приложения с правами администратора, один раз: ставит zapret-mac в /opt и правило
+# sudo, по которому приложение запускает /opt/zapret-mac/zapret-mac.sh без пароля.
+# Скрипт там принадлежит root, так что подменить его, не зная пароля, нельзя. $1 — пользователь
+cmd_gui_install() {
+  local u=${1:-} tmp
+  case $u in ''|root|*[!A-Za-z0-9._-]*) die "Не тот пользователь: $u" ;; esac
+  id -u "$u" >/dev/null 2>&1 || die "Нет пользователя $u"
+  RUSER=$u; SHORTCUT=""
+  RHOME=$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  ensure_installed
+  [ "$(cfg MODE transparent)" = transparent ] && ut_ensure
+  tmp=$(mktemp /tmp/zapret-mac-sudo.XXXXXX) || die "Не могу создать временный файл"
+  printf '# zapret-mac: приложение Zapret в строке меню управляет обходом без пароля\n%s ALL=(root) NOPASSWD: %s\n' \
+    "$u" "$SELF" > "$tmp"
+  if ! visudo -cf "$tmp" >/dev/null 2>&1; then rm -f "$tmp"; die "visudo не принял правило — sudo не тронут."; fi
+  install -m 440 -o root -g wheel "$tmp" "$SUDOERS" || { rm -f "$tmp"; die "Не могу записать $SUDOERS"; }
+  rm -f "$tmp"
+  grep -qE '^#includedir /(private/)?etc/sudoers\.d' /etc/sudoers 2>/dev/null ||
+    warn "В /etc/sudoers нет #includedir — приложению будет нужен пароль."
+  log "Установлен из приложения: zapret-mac $ZM_VERSION"
+  ok "zapret-mac $ZM_VERSION установлен, приложение управляет им без пароля."
+  [ -f "$PL_TPWS" ] && cmd_start   # был включён — перезапускаем с новым кодом
+  return 0
+}
+
 # ─── сторож (LaunchDaemon от root) ───────────────────────────────────
 # Ловит события маршрутизации (route monitor), поэтому VPN замечает сразу:
 #   VPN (TUN) включился  → снимает перенаправление, весь трафик идёт в VPN
 #   VPN выключился       → возвращает перенаправление, работает обход
+#   пауза из приложения  → как при VPN, пока пауза не кончится
 #   tpws упал            → снимает перенаправление, чтобы не пропал интернет
-# Плюс раз в CHECK_EVERY секунд (и после смены сети) проверяет YouTube и Discord
-# и при сбое сам подбирает стратегии в фоне.
-WD_STATE=""; WD_VPN=""; WD_NET=""; FAILS=0; NEXT_CHECK=0; BACKOFF=$CHECK_EVERY
-SEL_PID=""; LAST_FULL=0; FAIL_NOTIFIED=0
+#   сменилась сеть       → ставит стратегии, запомненные для этой сети, и скоро проверяет сайты
+#   Mac проснулся        → то же, что при смене сети
+# Плюс раз в CHECK_EVERY секунд проверяет YouTube и Discord и при сбое сам подбирает
+# стратегии в фоне, а раз в сутки скачивает свежие стратегии и списки.
+WD_STATE=""; WD_VPN=""; WD_EXTRA=""; WD_APP=""; WD_NET=""; FAILS=0; NEXT_CHECK=0; BACKOFF=$CHECK_EVERY
+SEL_PID=""; UPD_PID=""; LAST_FULL=0; LAST_TICK=0; FAIL_NOTIFIED=0; NEXT_UPDATE=0; STRAT_MTIME=""
 
 wd_status() { printf '%s %s\n' "$1" "$2" > "$RUN/status.new" && chmod 644 "$RUN/status.new" && mv -f "$RUN/status.new" "$RUN/status"; }
+
+# пауза включена и не кончилась; кончилась — убираем её
+pause_until() { local u; [ -f "$PAUSE_F" ] || return 1; read -r u < "$PAUSE_F"; case $u in ''|*[!0-9]*) u=0 ;; esac; printf '%s' "$u"; }
+paused() {
+  local u
+  u=$(pause_until) || return 1
+  [ "$u" = 0 ] && return 0
+  [ "$(date +%s)" -lt "$u" ] && return 0
+  rm -f "$PAUSE_F"
+  return 1
+}
+
+# какой VPN-клиент держит туннель — для подписи в приложении. Клиенты на Network
+# Extension (Happ, V2Box, FoXray, WireGuard) видны в scutil, остальных ищем по процессам
+vpn_app() {
+  local n
+  n=$(scutil --nc list 2>/dev/null | awk -F'"' '/\(Connected\)/ {print $2; exit}')
+  [ -z "$n" ] && n=$(ps -axco comm= 2>/dev/null | awk '
+    { c = tolower($0) }
+    c ~ /^amnezia/  { print "AmneziaVPN"; exit }
+    c ~ /incy/      { print "Incy"; exit }
+    c ~ /openvpn/   { print "OpenVPN"; exit }
+    c ~ /^hiddify/  { print "Hiddify"; exit }
+    c ~ /^outline/  { print "Outline"; exit }')
+  printf '%s' "${n:-VPN}"
+}
 
 # действующие настройки прокси одним быстрым вызовом (networksetup по всем службам — долго для каждых 5 секунд)
 sys_proxy_ours() {
@@ -1818,16 +2480,25 @@ sys_proxy_other() {
   scutil --proxy 2>/dev/null | grep -q 'SOCKSEnable : 1' && ! sys_proxy_ours
 }
 
+# событие в $RUN/events («время|текст»): открытое приложение покажет его само,
+# а если оно закрыто — уведомление через osascript
 notify() {
   local uid
+  if [ -w "$RUN" ]; then
+    printf '%s|%s\n' "$(date +%s)" "$1" >> "$RUN/events" && chmod 644 "$RUN/events"
+    if [ "$(wc -l < "$RUN/events")" -gt 100 ]; then
+      tail -n 50 "$RUN/events" > "$RUN/events.tmp" && mv -f "$RUN/events.tmp" "$RUN/events"
+    fi
+  fi
   uid=$(stat -f %u /dev/console 2>/dev/null)
   [ -n "$uid" ] && [ "$uid" -gt 0 ] || return 0
+  pgrep -x -U "$uid" "$APP_PROC" >/dev/null 2>&1 && return 0
   launchctl asuser "$uid" sudo -u "#$uid" /usr/bin/osascript \
     -e "display notification \"$1\" with title \"zapret-mac\"" >/dev/null 2>&1 &
 }
 
 reconcile() {   # $1 = full — проверить pf и tpws; без него — только не сменился ли VPN
-  local vpn mode st net
+  local vpn mode st net extra=""
   vpn=$(vpn_iface)
   [ "$1" = full ] || [ "$vpn" != "$WD_VPN" ] || return 0
   mode=$(cfg MODE transparent)
@@ -1835,9 +2506,26 @@ reconcile() {   # $1 = full — проверить pf и tpws; без него �
     log "Сеть сменилась — перезапускаю utunws (он шлёт пакеты на MAC шлюза)"
     launchctl kickstart -k "system/$LBL_UT" >/dev/null 2>&1
   fi
-  if [ -n "$vpn" ]; then
+  if paused; then
+    st=paused; extra=$(pause_until)
+    if [ "$WD_STATE" != paused ]; then
+      if [ "$extra" = 0 ]; then log "Пауза — обход снят, пока паузу не снимут"
+      else log "Пауза до $(date -r "$extra" '+%H:%M') — обход снят"; fi
+      sel_stop
+    fi
+    if [ "$mode" = transparent ] && fw_loaded; then
+      fw_off
+      launchctl kickstart -k "system/$LBL_TPWS" >/dev/null 2>&1
+    elif [ "$mode" = socks ] && sys_proxy_ours; then
+      proxy_off
+    fi
+  elif [ -n "$vpn" ]; then
     st=vpn
-    if [ "$vpn" != "$WD_VPN" ]; then log "VPN включён ($vpn) — весь трафик идёт через VPN"; sel_stop; fi
+    if [ "$vpn" != "$WD_VPN" ] || [ -z "$WD_APP" ]; then
+      WD_APP=$(vpn_app)
+      [ "$vpn" != "$WD_VPN" ] && { log "VPN включён ($WD_APP, $vpn) — весь трафик идёт через VPN"; sel_stop; }
+    fi
+    extra="$vpn $WD_APP"
     if [ "$mode" = transparent ] && fw_loaded; then
       fw_off
       # соединения, завёрнутые в tpws до включения VPN, сбрасываем — программы переподключатся уже через VPN
@@ -1853,6 +2541,13 @@ reconcile() {   # $1 = full — проверить pf и tpws; без него �
   else
     st=direct
     [ -n "$WD_VPN" ] && log "VPN выключен — работает обход"
+    net=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default" {print $2, $4; exit}')
+    if [ "$WD_STATE" != direct ] || [ "$net" != "$WD_NET" ]; then
+      [ "$WD_STATE" = direct ] && [ -n "$net" ] && log "Сеть сменилась ($net) — скоро проверю YouTube и Discord"
+      [ -n "$net" ] && net_apply
+      NEXT_CHECK=$(( SECONDS + 8 )); FAILS=0; BACKOFF=$CHECK_EVERY
+    fi
+    WD_NET=$net
     if [ "$mode" = transparent ]; then
       if ! fw_loaded || ! pf_on || ! ut_rules_ok; then
         if fw_on >/dev/null 2>&1; then
@@ -1865,22 +2560,29 @@ reconcile() {   # $1 = full — проверить pf и tpws; без него �
       # VPN-клиент в режиме прокси, выключаясь, сбрасывает и наш прокси — возвращаем
       proxy_on >/dev/null 2>&1 && log "Системный SOCKS-прокси восстановлен"
     fi
-    net=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default" {print $2, $4; exit}')
-    if [ "$WD_STATE" != direct ] || [ "$net" != "$WD_NET" ]; then
-      [ "$WD_STATE" = direct ] && log "Сеть сменилась ($net) — скоро проверю YouTube и Discord"
-      NEXT_CHECK=$(( SECONDS + 8 )); FAILS=0; BACKOFF=$CHECK_EVERY
-    fi
-    WD_NET=$net
   fi
-  { [ "$st" != "$WD_STATE" ] || [ "$vpn" != "$WD_VPN" ]; } && wd_status "$st" "$vpn"
-  WD_STATE=$st; WD_VPN=$vpn
+  [ "$st" = vpn ] || WD_APP=""
+  if [ "$WD_STATE" = paused ] && [ "$st" != paused ]; then
+    if [ "$st" = vpn ]; then log "Пауза кончилась — сейчас включён VPN, обход вернётся без него"
+    else log "Пауза кончилась — обход снова работает"; fi
+  fi
+  { [ "$st" != "$WD_STATE" ] || [ "$extra" != "$WD_EXTRA" ]; } && wd_status "$st" "$extra"
+  WD_STATE=$st; WD_VPN=$vpn; WD_EXTRA=$extra
+}
+
+# Mac спал: сеть могла смениться, а соединения — оборваться. Как при смене сети:
+# стратегии этой сети и скорая проверка
+wd_wake() {
+  log "Mac проснулся — проверяю сеть и обход"
+  WD_NET=""; FAILS=0; BACKOFF=$CHECK_EVERY; NEXT_CHECK=$(( SECONDS + 10 ))
 }
 
 sel_start() {
   log "YouTube или Discord не открываются — подбираю стратегии (ход подбора: $LOGS/select.log)"
   rm -f "$RUN/select.result"
   (
-    trap 'stop_test; ut_try_stop; exit 1' TERM
+    trap 'stop_test; ut_try_stop; prog_done; exit 1' TERM
+    SEL_WHO=daemon
     select_strategies auto > "$LOGS/select.log" 2>&1 &&
       printf '%s %s %s %s %s %s %s %s\n' "$SEL_PATH" "$SEL_Y" "$SEL_STY" "$SEL_YT" "$SEL_SY" "$SEL_UT" "$SEL_D" "$SEL_SD" \
         > "$RUN/select.result"
@@ -1892,6 +2594,7 @@ sel_stop() {
   [ -n "$SEL_PID" ] || return 0
   kill "$SEL_PID" 2>/dev/null; wait "$SEL_PID" 2>/dev/null
   SEL_PID=""
+  prog_done
   log "Подбор прерван"
 }
 
@@ -1907,6 +2610,7 @@ sel_poll() {
   sy=$SEL_SY; sd=$SEL_SD
   if [ "$p" = 1 ]; then
     log "Стратегии рабочие — перезапускаю tpws, utunws и перенаправление"
+    net_save
     fw_off
     launchctl kickstart -k "system/$LBL_TPWS" >/dev/null 2>&1
     [ -f "$PL_UT" ] && launchctl kickstart -k "system/$LBL_UT" >/dev/null 2>&1
@@ -1952,6 +2656,8 @@ health_tick() {
   sel_poll
   [ -z "$SEL_PID" ] || return 0
   [ "$WD_STATE" = direct ] || return 0
+  # приложение просит проверить поскорее (сняли паузу, обновились стратегии)
+  [ -f "$RUN/check-soon" ] && { rm -f "$RUN/check-soon"; [ "$NEXT_CHECK" -gt $(( SECONDS + 5 )) ] && NEXT_CHECK=$(( SECONDS + 5 )); }
   [ "$SECONDS" -ge "$NEXT_CHECK" ] || return 0
   # прозрачный режим, включённый при VPN, ещё ни разу не проверялся на этом Mac — проверяем первым делом
   if [ "$(cfg MODE transparent)" = transparent ] && [ "$(cfg TP_OK 0)" != 1 ]; then
@@ -1967,25 +2673,57 @@ health_tick() {
   fi
   [ "$(cfg AUTOFIX 1)" = 1 ] || return 0
   NEXT_CHECK=$(( SECONDS + CHECK_EVERY ))
-  detect_phys || return 0
-  # интернета нет вообще — это не блокировка, подбирать нечего
-  /usr/bin/curl -s -o /dev/null --noproxy '*' --interface "$PHYS" --connect-timeout 5 --max-time 8 "$CONTROL_URL" || return 0
+  # интернета нет вообще — это не блокировка, подбирать нечего. Сеть после пробуждения
+  # поднимается не сразу, поэтому смотрим снова через полминуты
+  if ! detect_phys || ! /usr/bin/curl -s -o /dev/null --noproxy '*' --interface "$PHYS" \
+       --connect-timeout 5 --max-time 8 "$CONTROL_URL"; then
+    NEXT_CHECK=$(( SECONDS + 30 ))
+    return 0
+  fi
   if [ "$(cfg MODE transparent)" = socks ]; then run_checks "socks:$SOCKS_PORT"; else run_checks apps; fi
+  check_save bypass
+  log "Проверка: $(check_line)"
   if [ "$SCORE_Y" -eq "$NY" ] && [ "$SCORE_D" -eq "$ND" ]; then
-    { [ "$FAILS" -gt 0 ] || [ "$FAIL_NOTIFIED" = 1 ]; } && log "Проверка: YouTube и Discord снова открываются"
     FAILS=0; FAIL_NOTIFIED=0; BACKOFF=$CHECK_EVERY
     return 0
   fi
   FAILS=$(( FAILS + 1 ))
-  log "Проверка: не открылось — $LAST_FAIL"
   if [ "$FAILS" -lt 2 ]; then NEXT_CHECK=$(( SECONDS + 45 )); return 0; fi   # перепроверить, вдруг случайность
   FAILS=0
   sel_start
 }
 
+# раз в сутки — свежие стратегии и списки. Отдельным процессом: скачивание может занять
+# минуту, а сторож тем временем должен замечать VPN
+upd_tick() {
+  local last
+  if [ -n "$UPD_PID" ]; then
+    kill -0 "$UPD_PID" 2>/dev/null && return 0
+    wait "$UPD_PID" 2>/dev/null; UPD_PID=""
+  fi
+  [ "$SECONDS" -ge "$NEXT_UPDATE" ] || return 0
+  NEXT_UPDATE=$(( SECONDS + 3600 ))
+  [ -z "$SEL_PID" ] || return 0
+  case $WD_STATE in direct|vpn|paused) ;; *) return 0 ;; esac
+  last=$(cat "$RUN/strat-updated" 2>/dev/null)
+  case $last in ''|*[!0-9]*) last=0 ;; esac
+  [ $(( $(date +%s) - last )) -ge "$UPDATE_EVERY" ] || return 0
+  /bin/bash "$SELF" update-strategies auto >> "$LOGS/update.log" 2>&1 &
+  UPD_PID=$!
+}
+
+# strategies.conf поменялся (обновление из приложения или upd_tick) — перечитываем
+strat_watch() {
+  local m
+  m=$(stat -f %m "$STRAT_FILE" 2>/dev/null)
+  [ "$m" = "$STRAT_MTIME" ] && return 0
+  STRAT_MTIME=$m
+  strat_reload
+}
+
 log_rotate() {
   local f
-  for f in "$LOGS/watchdog.log" "$LOGS/watchdog.err" "$LOGS/tpws.log" "$LOGS/utunws.log"; do
+  for f in "$LOGS/watchdog.log" "$LOGS/watchdog.err" "$LOGS/tpws.log" "$LOGS/utunws.log" "$LOGS/update.log"; do
     [ -f "$f" ] && [ "$(stat -f %z "$f" 2>/dev/null || echo 0)" -gt 524288 ] || continue
     tail -n 2000 "$f" > "$f.tmp" && cat "$f.tmp" > "$f"; rm -f "$f.tmp"
   done
@@ -1996,13 +2734,17 @@ daemon_main() {
   [ "$(id -u)" -eq 0 ] || die "Сторож запускается только из launchd."
   mkdir -p "$LOGS" "$RUN"
   CHECK_LIGHT=1
-  log "Сторож запущен (zapret-mac $ZM_VERSION, режим: $(mode_name))"
+  log "Сторож запущен (zapret-mac $ZM_VERSION, режим: $(mode_name), стратегии: версия $STRAT_VER)"
   pf_give "$RUN/pf-token"   # токен от прошлого запуска — новый возьмём ниже
-  # остатки подбора, прерванного вместе с терминалом
+  # остатки подбора и обновления, прерванных вместе с терминалом
   pfctl -q -a "$(anchor_test)" -F all >/dev/null 2>&1; pf_give "$RUN/pf-token-test"
-  trap 'sel_stop; log "Сторож остановлен"; exit 0' TERM INT
+  rm -f "$RUN/progress"; rmdir "$RUN/update.lock" 2>/dev/null
+  STRAT_MTIME=$(stat -f %m "$STRAT_FILE" 2>/dev/null)
+  NEXT_UPDATE=$(( SECONDS + 120 ))   # первое обновление — через пару минут после запуска
+  trap 'sel_stop; [ -n "$UPD_PID" ] && kill "$UPD_PID" 2>/dev/null; log "Сторож остановлен"; exit 0' TERM INT
   reconcile full; LAST_FULL=$SECONDS
   exec 3< <(exec route -n monitor 2>/dev/null)
+  LAST_TICK=$SECONDS
   while true; do
     ev=0; t0=$SECONDS
     if read -r -t 5 line <&3; then
@@ -2013,12 +2755,17 @@ daemon_main() {
       exec 3<&-
       exec 3< <(exec route -n monitor 2>/dev/null)
     fi
+    # read ждёт не дольше 5 секунд; если с прошлого круга прошло больше полуминуты — Mac спал
+    if [ $(( SECONDS - LAST_TICK )) -gt 30 ]; then wd_wake; LAST_FULL=0; fi
     [ "$ev" = 1 ] && reconcile
     if [ $(( SECONDS - LAST_FULL )) -ge 5 ]; then
+      strat_watch
       reconcile full; LAST_FULL=$SECONDS
       health_tick
+      upd_tick
       log_rotate
     fi
+    LAST_TICK=$SECONDS
   done
 }
 
@@ -2105,10 +2852,15 @@ menu() {
 
 usage() {
   say "Использование: bash $0 [auto|start|stop|restart|test [all]|check|status|discord|autostart|add|dns|update|uninstall]"
+  say "Для приложения: on|off|pause МИНУТ|resume|info|check-now|update-strategies|sites on|off|site-add ДОМЕН…|site-del ДОМЕН…|sites-select|dns on|off|uninstall yes|gui-install ПОЛЬЗОВАТЕЛЬ"
 }
 
 # для тестов: ZM_LIB=1 . zapret-mac.sh — подключить функции, ничего не запуская
 [ "${ZM_LIB:-}" = 1 ] && { return 0 2>/dev/null || exit 0; }
+
+# долгие команды из приложения пишут ход ещё и в select.log: его видно в журналах приложения
+# SIGPIPE не ловим: если приложение закроется на середине, скрипт всё равно уберёт за собой
+to_select_log() { trap '' PIPE; mkdir -p "$LOGS" && exec > >(tee "$LOGS/select.log") 2>&1; }
 
 if [ "$(id -u)" -eq 0 ]; then
   case "${1:-}" in
@@ -2116,7 +2868,7 @@ if [ "$(id -u)" -eq 0 ]; then
     install)   cmd_install ;;
     auto)      cmd_auto ;;
     start)     cmd_start ;;
-    stop)      cmd_stop ;;
+    stop|off)  cmd_stop ;;
     restart)   cmd_stop; cmd_start ;;
     test)      cmd_test "${2:-}" ;;
     choose)    cmd_choose ;;
@@ -2125,9 +2877,20 @@ if [ "$(id -u)" -eq 0 ]; then
     add)       cmd_add ;;
     autolist)  cmd_autolist ;;
     settings)  cmd_settings ;;
-    dns)       cmd_dns ;;
+    dns)       if [ -n "${2:-}" ]; then cmd_dns_set "$2"; else cmd_dns; fi ;;
     update)    cmd_update ;;
-    uninstall) cmd_uninstall ;;
+    uninstall) cmd_uninstall "${2:-}" ;;
+    on)        to_select_log; cmd_on ;;
+    pause)     cmd_pause "${2:-0}" ;;
+    resume)    cmd_resume ;;
+    info)      cmd_info ;;
+    check-now) cmd_check_now ;;
+    update-strategies) cmd_update_strategies "${2:-}" ;;
+    sites)     cmd_sites "${2:-}" ;;
+    site-add)  shift; cmd_site_add "$@" ;;
+    site-del)  shift; cmd_site_del "$@" ;;
+    sites-select) to_select_log; cmd_sites_select ;;
+    gui-install) cmd_gui_install "${2:-}" ;;
     daemon)    daemon_main ;;
     utunws-run) ut_run ;;
     *)         usage ;;
@@ -2138,6 +2901,7 @@ else
     discord)        cmd_discord ;;
     discord-auto)   cmd_discord_auto ;;
     autostart)      cmd_ds_autostart ;;
+    info)           cmd_info ;;
     daemon|utunws-run) die "Это запускает только launchd." ;;
     help|-h|--help) usage ;;
     *)              user_bootstrap; as_root "$@" ;;
