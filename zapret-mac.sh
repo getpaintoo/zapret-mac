@@ -471,7 +471,8 @@ probe_user() {
 #        apps       — как обычная программа: от имени пользователя, без прокси
 #        utun       — от имени пользователя через физический интерфейс: при включённом
 #                     VPN так видно utunws (правила для этого грузит ut_test_on)
-# результат: LAST_RC[i] (ok|fail|skip), SCORE_Y из NY, SCORE_D из ND, SCORE_U из NU, LAST_FAIL
+# результат: LAST_RC[i] (ok|fail|skip), LAST_CODE[i] — код curl, если не открылось,
+# SCORE_Y из NY, SCORE_D из ND, SCORE_U из NU, LAST_FAIL
 run_checks() {
   local how=$1 tmp i t url pu="" pids=() rc
   local -a px comp pre
@@ -498,7 +499,7 @@ run_checks() {
     pids+=($!)
   done
   wait "${pids[@]}" 2>/dev/null
-  SCORE_Y=0; SCORE_D=0; SCORE_U=0; NY=0; ND=0; LAST_FAIL=""; LAST_RC=()
+  SCORE_Y=0; SCORE_D=0; SCORE_U=0; NY=0; ND=0; LAST_FAIL=""; LAST_RC=(); LAST_CODE=()
   for (( i=0; i<NT; i++ )); do
     t=${TARGETS[$i]}
     # NY и ND — размер группы целиком, даже если проверяли только другую
@@ -510,7 +511,7 @@ run_checks() {
       LAST_RC[$i]=ok
       case ${t%%|*} in Y) SCORE_Y=$(( SCORE_Y + 1 )) ;; D) SCORE_D=$(( SCORE_D + 1 )) ;; *) SCORE_U=$(( SCORE_U + 1 )) ;; esac
     else
-      LAST_RC[$i]=fail
+      LAST_RC[$i]=fail; LAST_CODE[$i]=${rc:-?}
       LAST_FAIL="$LAST_FAIL, $(t_label "$t")"
     fi
   done
@@ -530,13 +531,26 @@ recheck_full() {
   return 0
 }
 
+# код curl — по-человечески: видно, режут ли соединение, рвут или оно просто не ответило
+curl_why() {
+  case $1 in
+    6)  printf 'не нашёлся адрес' ;;
+    7)  printf 'нет соединения' ;;
+    28) printf 'тайм-аут' ;;
+    35) printf 'оборвался TLS' ;;
+    52|56) printf 'соединение сброшено' ;;
+    60) printf 'чужой сертификат' ;;
+    *)  printf 'код %s' "$1" ;;
+  esac
+}
+
 print_checks() {
   local i
   for (( i=0; i<NT; i++ )); do
     case ${LAST_RC[$i]} in
       skip) ;;
       ok)  printf '   %s✓%s %s\n' "$G" "$N" "$(t_label "${TARGETS[$i]}")" ;;
-      *)   printf '   %s✗%s %s\n' "$R" "$N" "$(t_label "${TARGETS[$i]}")" ;;
+      *)   printf '   %s✗%s %s %s(%s)%s\n' "$R" "$N" "$(t_label "${TARGETS[$i]}")" "$D" "$(curl_why "${LAST_CODE[$i]}")" "$N" ;;
     esac
   done
 }
@@ -2271,14 +2285,18 @@ check_save() {
   [ -w "$RUN" ] || return 0
   { printf 'check_time=%s\ncheck_via=%s\n' "$(date +%s)" "$1"
     for (( i=0; i<NT; i++ )); do
-      [ "${LAST_RC[$i]}" = skip ] || printf 'chk=%s|%s|%s\n' "${LAST_RC[$i]}" "${TARGETS[$i]%%|*}" "$(t_label "${TARGETS[$i]}")"
+      [ "${LAST_RC[$i]}" = skip ] || printf 'chk=%s|%s|%s|%s\n' "${LAST_RC[$i]}" "${TARGETS[$i]%%|*}" "$(t_label "${TARGETS[$i]}")" \
+        "$([ "${LAST_RC[$i]}" = fail ] && curl_why "${LAST_CODE[$i]}")"
     done
   } > "$RUN/check.new" && chmod 644 "$RUN/check.new" && mv -f "$RUN/check.new" "$RUN/check"
 }
-check_line() {   # «YouTube 3/3 · Discord 5/5 · свои сайты 1/2 — не открылось: …»
-  local s="YouTube $SCORE_Y/$NY · Discord $SCORE_D/$ND"
+check_line() {   # «YouTube 3/3 · Discord 5/5 · свои сайты 1/2 — не открылось: x.com (тайм-аут)»
+  local s="YouTube $SCORE_Y/$NY · Discord $SCORE_D/$ND" f="" i
   [ "$NU" -gt 0 ] && s="$s · свои сайты $SCORE_U/$NU"
-  [ -n "$LAST_FAIL" ] && s="$s — не открылось: $LAST_FAIL"
+  for (( i=0; i<NT; i++ )); do
+    [ "${LAST_RC[$i]}" = fail ] && f="$f, $(t_label "${TARGETS[$i]}") ($(curl_why "${LAST_CODE[$i]}"))"
+  done
+  [ -n "$f" ] && s="$s — не открылось: ${f#, }"
   printf '%s' "$s"
 }
 
@@ -2401,6 +2419,46 @@ cmd_info() {
   [ -f "$RUN/progress" ] && printf 'progress=%s\n' "$(cat "$RUN/progress")"
   [ -f "$RUN/check" ] && cat "$RUN/check"
   return 0
+}
+
+# Диагностика для разбора, когда «через обход» не открывается ничего: pf, его состояния
+# и лимиты, и одни и те же сайты — от пользователя (через перенаправление) и от root
+# напрямую через физический интерфейс. Ничего не меняет
+cmd_diag() {
+  local u url rc t a pu
+  say "zapret-mac $ZM_VERSION · режим $(mode_name) · стратегии $STRAT_VER · $(date '+%d.%m %H:%M:%S')"
+  say "YouTube — $(yt_desc), Discord — $(ds_desc), свои сайты — $(us_desc)"
+  detect_phys; say "Сеть: $PHYS, шлюз $PHYS_GW, адрес $PHYS_IP; VPN: $(vpn_iface || echo нет)"
+  say "Состояние сторожа: $(cat "$RUN/status" 2>/dev/null); пауза: $(pause_until || echo нет)"
+  say ""; say "── pf"
+  pfctl -si 2>/dev/null | grep -E 'Status|current entries|searches|inserts|removals|memory|state-limit|src-limit'
+  pfctl -sm 2>/dev/null | grep -E 'states|src-nodes|frags|table-entries'
+  say "якоря в основном наборе:"
+  { pfctl -sn; pfctl -sr; } 2>/dev/null | grep -E 'anchor' | sed 's/^/   /'
+  say "наш якорь $(anchor_main):"
+  { pfctl -a "$(anchor_main)" -sn; pfctl -a "$(anchor_main)" -sr; } 2>/dev/null | grep -v '^$' | sed 's/^/   /'
+  say "состояний к tpws (127.0.0.1:$TP_PORT): $(pfctl -ss 2>/dev/null | grep -cF "127.0.0.1:$TP_PORT"), всего: $(pfctl -ss 2>/dev/null | grep -c .)"
+  say ""; say "── процессы"
+  say "tpws: $(pgrep -f "$BIN_DIR/tpws" | tr '\n' ' ')· порт $TP_PORT: $(port_bound "$TP_PORT" && echo слушает || echo нет)"
+  say "utunws: $(pgrep -f "$UTUNWS" | tr '\n' ' ')· $UT_IF: $(ut_up && echo поднят || echo нет)"
+  say ""; say "── сайты: от пользователя (как программы) и от root напрямую через $PHYS"
+  pu=$(probe_user)
+  for url in "$CONTROL_URL" https://example.com/ https://speedtest.net/ https://www.youtube.com/ https://i.ytimg.com/ https://discord.com/; do
+    for a in apps direct; do
+      if [ "$a" = apps ]; then
+        t=$(sudo -u "$pu" /usr/bin/curl -s -o /dev/null --noproxy '*' --connect-timeout 5 --max-time 8 -A "$UA" \
+              -w '%{http_code} %{time_connect}s/%{time_appconnect}s/%{time_total}s %{size_download}B' "$url" 2>/dev/null); rc=$?
+      else
+        t=$(/usr/bin/curl -s -o /dev/null --noproxy '*' --interface "$PHYS" --connect-timeout 5 --max-time 8 -A "$UA" \
+              -w '%{http_code} %{time_connect}s/%{time_appconnect}s/%{time_total}s %{size_download}B' "$url" 2>/dev/null); rc=$?
+      fi
+      printf '   %-6s %-45s rc=%-3s %s%s\n' "$a" "${url#https://}" "$rc" "$t" "$([ "$rc" != 0 ] && printf ' (%s)' "$(curl_why "$rc")")"
+    done
+  done
+  say "состояния pf к сайтам после проверки:"
+  pfctl -ss 2>/dev/null | grep -E "127\.0\.0\.1:$TP_PORT|$UT_PEER" | head -12 | sed 's/^/   /'
+  say ""; say "── tpws.log"; tail -n 5 "$LOGS/tpws.log" 2>/dev/null | sed 's/^/   /'
+  say "── utunws.log"; tail -n 3 "$LOGS/utunws.log" 2>/dev/null | sed 's/^/   /'
 }
 
 # Из приложения с правами администратора, один раз: ставит zapret-mac в /opt и правило
@@ -2688,6 +2746,12 @@ health_tick() {
     return 0
   fi
   FAILS=$(( FAILS + 1 ))
+  # диагностику — сразу, пока сеть в том же состоянии, и в файл: если перенаправление
+  # ломает соединения, посмотреть её можно будет и потом. Отдельным процессом — она идёт с минуту
+  if [ "$FAILS" = 1 ] && [ $(( $(date +%s) - $(stat -f %m "$LOGS/diag.log" 2>/dev/null || echo 0) )) -gt 600 ]; then
+    ( cmd_diag > "$LOGS/diag.log.new" 2>&1 && mv -f "$LOGS/diag.log.new" "$LOGS/diag.log" ) &
+    log "Диагностика — в $LOGS/diag.log"
+  fi
   if [ "$FAILS" -lt 2 ]; then NEXT_CHECK=$(( SECONDS + 45 )); return 0; fi   # перепроверить, вдруг случайность
   FAILS=0
   sel_start
@@ -2852,7 +2916,7 @@ menu() {
 
 usage() {
   say "Использование: bash $0 [auto|start|stop|restart|test [all]|check|status|discord|autostart|add|dns|update|uninstall]"
-  say "Для приложения: on|off|pause МИНУТ|resume|info|check-now|update-strategies|sites on|off|site-add ДОМЕН…|site-del ДОМЕН…|sites-select|dns on|off|uninstall yes|gui-install ПОЛЬЗОВАТЕЛЬ"
+  say "Для приложения: on|off|pause МИНУТ|resume|info|check-now|diag|update-strategies|sites on|off|site-add ДОМЕН…|site-del ДОМЕН…|sites-select|dns on|off|uninstall yes|gui-install ПОЛЬЗОВАТЕЛЬ"
 }
 
 # для тестов: ZM_LIB=1 . zapret-mac.sh — подключить функции, ничего не запуская
@@ -2885,6 +2949,7 @@ if [ "$(id -u)" -eq 0 ]; then
     resume)    cmd_resume ;;
     info)      cmd_info ;;
     check-now) cmd_check_now ;;
+    diag)      cmd_diag ;;
     update-strategies) cmd_update_strategies "${2:-}" ;;
     sites)     cmd_sites "${2:-}" ;;
     site-add)  shift; cmd_site_add "$@" ;;

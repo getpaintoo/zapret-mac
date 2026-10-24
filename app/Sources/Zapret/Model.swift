@@ -41,6 +41,7 @@ struct CheckItem: Identifiable, Hashable {
     let ok: Bool
     let group: String      // Y, D, U
     let label: String
+    var why = ""           // почему не открылось: тайм-аут, сброс, TLS…
     var id: String { group + label }
 }
 
@@ -220,8 +221,8 @@ final class Model: ObservableObject {
                 guard let eq = line.firstIndex(of: "=") else { continue }
                 let k = String(line[..<eq]), v = String(line[line.index(after: eq)...])
                 if k == "chk" {
-                    let p = v.split(separator: "|", maxSplits: 2).map(String.init)
-                    if p.count == 3 { c.append(CheckItem(ok: p[0] == "ok", group: p[1], label: p[2])) }
+                    let p = v.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false).map(String.init)
+                    if p.count >= 3 { c.append(CheckItem(ok: p[0] == "ok", group: p[1], label: p[2], why: p.count > 3 ? p[3] : "")) }
                 } else {
                     d[k] = v
                 }
@@ -486,7 +487,7 @@ final class Model: ObservableObject {
 
     static let logFiles: [(String, String)] = [
         ("Сторож", "watchdog.log"), ("Подбор", "select.log"), ("Обновления", "update.log"),
-        ("tpws", "tpws.log"), ("utunws", "utunws.log"),
+        ("tpws", "tpws.log"), ("utunws", "utunws.log"), ("Диагностика", "diag.log"),
     ]
 
     func readLog(_ file: String, lines: Int = 400) -> String {

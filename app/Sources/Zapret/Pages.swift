@@ -384,6 +384,7 @@ struct OverviewView: View {
                             Image(systemName: c.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
                                 .foregroundStyle(c.ok ? Palette.run : Palette.stop).font(.system(size: 12))
                             Text(c.label).font(.system(size: 12))
+                            if !c.why.isEmpty { Text(c.why).font(.system(size: 10.5)).foregroundStyle(.secondary) }
                             Spacer()
                             Text(group(c.group)).font(.system(size: 10)).foregroundStyle(.tertiary)
                         }

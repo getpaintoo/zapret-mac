@@ -13,7 +13,7 @@ enum Snapshot {
             "since": "\(Int(Date().timeIntervalSince1970) - 7200)", "check_time": "\(Int(Date().timeIntervalSince1970) - 600)", "check_via": "bypass",
         ]
         let checks = [CheckItem(ok: true, group: "D", label: "Discord"), CheckItem(ok: true, group: "D", label: "Discord: шлюз"),
-                      CheckItem(ok: true, group: "Y", label: "YouTube"), CheckItem(ok: false, group: "U", label: "x.com")]
+                      CheckItem(ok: true, group: "Y", label: "YouTube"), CheckItem(ok: false, group: "U", label: "x.com", why: "тайм-аут")]
         func with(_ extra: [String: String]) -> [String: String] { base.merging(extra) { $1 } }
         let pauseTill = "\(Int(Date().timeIntervalSince1970) + 3000)"
         let cases: [(String, (Model) -> Void)] = [
