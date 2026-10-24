@@ -659,7 +659,7 @@ warn_other_proxies() {
   while IFS= read -r svc; do
     [ -n "$svc" ] || continue
     networksetup -getautoproxyurl "$svc" 2>/dev/null | grep -q '^Enabled: Yes' &&
-      warn "В «$svc» включена автонастройка прокси (PAC) — она может перебивать обход."
+      warn "В «${svc}» включена автонастройка прокси (PAC) — она может перебивать обход."
   done <<< "$(services)"
 }
 
@@ -1678,7 +1678,7 @@ net_apply() {
   local old_tp old_ut
   old_tp="$(strat_of Y) $(strat_of D)"; old_ut="$(ut_of) $(yt_engine)"
   net_load || return 0
-  log "Сеть «$NET_LABEL» знакома — ставлю её стратегии: YouTube — $(yt_desc), Discord — $(ds_desc)"
+  log "Сеть «${NET_LABEL}» знакома — ставлю её стратегии: YouTube — $(yt_desc), Discord — $(ds_desc)"
   if [ "$old_tp" != "$(strat_of Y) $(strat_of D)" ]; then
     tpws_apply "$(cfg MODE transparent)" >/dev/null 2>&1 || log "tpws не запустился со стратегиями этой сети"
   fi
@@ -2136,7 +2136,7 @@ cmd_on() {
   ensure_installed
   rm -f "$PAUSE_F"
   [ "$(cfg MODE transparent)" = transparent ] && ut_ensure
-  net_load && say "Сеть «$NET_LABEL» знакома — начинаю с её стратегий."
+  net_load && say "Сеть «${NET_LABEL}» знакома — начинаю с её стратегий."
   SEL_WHO=gui
   if select_strategies auto; then
     say ""
@@ -2782,7 +2782,7 @@ user_bootstrap() {
   [ "$me" = "$SELF" ] && return 0
   [ -f "$me" ] || die "Запусти скрипт из файла: bash zapret-mac.sh"
   [ -f "$SELF" ] && cmp -s "$me" "$SELF" && return 0
-  say "Устанавливаю zapret-mac $ZM_VERSION в $DIR…"
+  say "Устанавливаю zapret-mac $ZM_VERSION в ${DIR}…"
   sudo -n true 2>/dev/null || say "${D}Нужен пароль от Mac (при вводе символы не видны).${N}"
   sudo /bin/bash "$me" install || die "Установка не удалась."
 }

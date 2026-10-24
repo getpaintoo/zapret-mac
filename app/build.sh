@@ -13,7 +13,7 @@ build="$here/build"
 app="$build/Zapret.app"
 
 cd "$here"
-echo "Собираю Zapret $ver…"
+echo "Собираю Zapret ${ver}…"
 for arch in arm64 x86_64; do
   swift build -c release --arch "$arch" 2>&1 | grep -vE '^\[[0-9]+/[0-9]+\]' || true
   [ -x ".build/$arch-apple-macosx/release/Zapret" ] || { echo "Сборка для $arch не удалась" >&2; exit 1; }

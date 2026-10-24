@@ -59,5 +59,11 @@ t bad "неизвестный вид"                  "$V" "$TP" "$UT" "$YT" "n
 t bad "версия не числом"                 "version|v2" "$TP" "$UT" "$YT"
 t bad "строка без параметров"            "$V" "tpws|A" "$UT" "$YT"
 
+# bash 3.2 под UTF-8 считает русские буквы, «» и … частью имени переменной: в "«$x»" подставится
+# пустая переменная x». Такие места пишутся как ${x}
+bad=$(perl -ne 'print "$ARGV:$.: $&\n" if !/^\s*#/ && /\$[A-Za-z_]\w*(?=[\x80-\xff])/; close ARGV if eof' \
+        "$here/zapret-mac.sh" "$here/app/build.sh" "$here"/tests/*.sh)
+[ -z "$bad" ] || { echo "FAIL: переменная вплотную к не-ASCII символу, нужны фигурные скобки:"; echo "$bad"; fails=$(( fails + 1 )); }
+
 echo "Ошибок: $fails"
 [ "$fails" -eq 0 ]
