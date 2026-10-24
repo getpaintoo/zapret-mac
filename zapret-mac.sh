@@ -799,11 +799,15 @@ ut_rules_ok() { if ut_active; then fw_ut_loaded; else ! fw_ut_loaded; fi; }
 # локального порта и ищем в таблице состояний pf именно это соединение, завёрнутое на
 # 127.0.0.1:988. Просто «есть такие состояния» не годится: долгие соединения остаются
 # в таблице с тех пор, когда перехват работал, и проверка проходила бы и без него
+# Результат — ещё и REDIR_INFO для журнала: код curl и состояния pf этого соединения (по ним
+# видно, ушло ли оно в tpws, напрямую или не ушло никуда)
 redirect_works() {
-  local port=$(( 40000 + RANDOM % 20000 ))
+  local port=$(( 40000 + RANDOM % 20000 )) rc st
   sudo -u "$(probe_user)" /usr/bin/curl -s -o /dev/null --noproxy '*' --connect-timeout 5 --max-time 8 \
-    --local-port "$port" -A "$UA" "$CONTROL_URL" || return 1
-  pfctl -s state 2>/dev/null | grep -F "127.0.0.1:$TP_PORT" | grep -qF ":$port "
+    --local-port "$port" -A "$UA" "$CONTROL_URL"; rc=$?
+  st=$(pfctl -s state 2>/dev/null | grep -F ":$port ")
+  REDIR_INFO="curl rc=$rc, порт $port, состояния: $(printf '%s' "${st:-нет}" | tr -s ' ' | tr '\n' ';' | cut -c1-400)"
+  [ "$rc" = 0 ] && printf '%s\n' "$st" | grep -qF "127.0.0.1:$TP_PORT"
 }
 
 pf_conf_patch() {
@@ -839,15 +843,25 @@ fw_try() {
     fw_on; return 2
   fi
   fw_on && redirect_works && return 0
-  if [ "$(cfg PF_ROOT com.apple)" = com.apple ]; then
-    fw_off
-    pf_conf_patch || return 1
-    patched=1
-    cfg_set PF_ROOT zapret-mac
-    fw_on && redirect_works && return 0
-  fi
+  log "Перехват в tpws не работает с якорем $(anchor_main): $REDIR_INFO"
+  # Пробуем второй якорь. com.apple/* есть в системном наборе pf всегда; zapret-mac/* —
+  # только пока в загруженном наборе есть строки из /etc/pf.conf (его перезагружают и
+  # другие программы)
   fw_off
-  if [ "$patched" = 1 ]; then pf_conf_unpatch; cfg_set PF_ROOT com.apple; fi
+  if [ "$(cfg PF_ROOT com.apple)" = com.apple ]; then
+    if pf_conf_patch; then patched=1; cfg_set PF_ROOT zapret-mac; fi
+  else
+    cfg_set PF_ROOT com.apple; patched=2
+  fi
+  if [ "$patched" != 0 ]; then
+    if fw_on && redirect_works; then log "Перехват работает с якорем $(anchor_main)"; return 0; fi
+    log "Перехват в tpws не работает и с якорем $(anchor_main): $REDIR_INFO"
+    fw_off
+  fi
+  case $patched in
+    1) pf_conf_unpatch; cfg_set PF_ROOT com.apple ;;
+    2) cfg_set PF_ROOT zapret-mac ;;
+  esac
   return 1
 }
 
@@ -2484,7 +2498,8 @@ cmd_diag() {
   say "наш якорь $(anchor_main):"
   { pfctl -a "$(anchor_main)" -sn; pfctl -a "$(anchor_main)" -sr; } 2>/dev/null | grep -v '^$' | sed 's/^/   /'
   say "состояний к tpws (127.0.0.1:$TP_PORT): $(pfctl -ss 2>/dev/null | grep -cF "127.0.0.1:$TP_PORT"), всего: $(pfctl -ss 2>/dev/null | grep -c .)"
-  say "перехват программ в tpws (своё соединение по своему порту): $(redirect_works && echo работает || echo НЕ РАБОТАЕТ)"
+  if redirect_works; then a=работает; else a="НЕ РАБОТАЕТ"; fi
+  say "перехват программ в tpws (своё соединение по своему порту): $a — $REDIR_INFO"
   say "DNS: $(networksetup -getdnsservers Wi-Fi 2>/dev/null | tr '\n' ' ')· 8.8.8.8 на www.youtube.com: $(dns_spoofed && echo 'подделка (NXDOMAIN)' || echo нормально)"
   say ""; say "── процессы"
   say "tpws: $(pgrep -f "$BIN_DIR/tpws" | tr '\n' ' ')· порт $TP_PORT: $(port_bound "$TP_PORT" && echo слушает || echo нет)"
@@ -2820,13 +2835,13 @@ health_tick() {
   # выключил бы utunws, а с ним рабочие YouTube и Discord. «Включить» проверит заново и при
   # настоящей поломке сам перейдёт на SOCKS
   if [ "$(cfg MODE transparent)" = transparent ] && ! redirect_works; then
-    log "Программы идут мимо tpws — перезагружаю правила pf"
+    log "Программы идут мимо tpws ($REDIR_INFO) — перезагружаю правила pf"
     fw_off; fw_on >/dev/null 2>&1
     if redirect_works; then
       log "Перехват в tpws снова работает"
     elif [ "$REDIRECT_NOTIFIED" != 1 ]; then
       REDIRECT_NOTIFIED=1
-      log "Перехват в tpws не работает и после перезагрузки правил — свои сайты идут напрямую (подробности: diag)"
+      log "Перехват в tpws не работает и после перезагрузки правил ($REDIR_INFO) — свои сайты идут напрямую"
       notify "Свои сайты идут мимо обхода — нажми «Выключить» и «Включить»"
     fi
   else
