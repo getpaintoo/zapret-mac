@@ -139,6 +139,7 @@ final class Model: ObservableObject {
     var since: Date? { Double(info["since"] ?? "").map { Date(timeIntervalSince1970: $0) } }
     var userSitesOn: Bool { info["user_sites"] != "0" }
     var dnsOn: Bool { info["dns"] == "1" }
+    var dnsSpoofed: Bool { info["dns_spoof"] == "1" }
 
     /// Для снимков панели (--snapshot): состояние без службы.
     func loadPreview(info: [String: String], checks: [CheckItem] = [], busy: Busy? = nil, busyLine: String = "",

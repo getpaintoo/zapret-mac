@@ -177,8 +177,13 @@ struct ExtrasView: View {
                     }
                 }
                 SectionCard {
-                    SwitchRow(title: "DNS Google и Cloudflare", caption: "8.8.8.8 и 1.1.1.1 вместо DNS провайдера — если он подменяет ответы.",
+                    SwitchRow(title: "DNS Google и Cloudflare", caption: "8.8.8.8 и 1.1.1.1 вместо DNS провайдера. В России с августа 2026 года ТСПУ подменяет их ответы — обычно лучше выключить.",
                               isOn: m.dnsOn, disabled: m.busy != nil) { m.setDNS($0) }
+                    if m.dnsSpoofed {
+                        Text("Провайдер подменяет ответы этих DNS: YouTube для них «не существует». Выключи — DNS роутера отвечает правильно.")
+                            .font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.stop)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 SectionCard {
                     if confirmRemove {

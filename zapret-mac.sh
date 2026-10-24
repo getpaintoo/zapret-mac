@@ -721,6 +721,12 @@ ut_rules() {
     "$PHYS" "$UT_IF" "$UT_PEER" "$DS_TCP"
   printf 'pass out quick on %s route-to (%s %s) inet proto udp from any to !<zm_skip4> port { %s } user { >root } no state\n' \
     "$PHYS" "$UT_IF" "$UT_PEER" "$DS_UDP"
+  # Ответы — тоже своим правилом quick и без состояния. Иначе их подберёт чужое правило
+  # с keep state (общий доступ к интернету, его включают и виртуальные машины, ставит
+  # «pass on en0 all flags any keep state»): по ответу на SYN появится состояние, и
+  # дальше пакеты соединения пойдут по нему напрямую, мимо utunws, — он увидит один SYN
+  printf 'pass in quick on %s inet proto tcp from <zm_ds4> port { %s } to any no state\n' "$PHYS" "$DS_TCP"
+  printf 'pass in quick on %s inet proto udp from any port { %s } to any no state\n' "$PHYS" "$DS_UDP"
   # QUIC к Discord — сразу отказ, приложение уходит на TCP, то есть в utunws
   printf 'block return out quick on %s inet proto udp from any to <zm_ds4> port 443 user { >root }\n' "$PHYS"
   printf 'block return out quick on %s inet6 proto { tcp, udp } from any to <zm_ds6> user { >root }\n' "$PHYS"
@@ -728,6 +734,7 @@ ut_rules() {
   # YouTube через utunws: TCP к Google — туда же, QUIC и IPv6 к Google — отказ
   printf 'pass out quick on %s route-to (%s %s) inet proto tcp from any to <zm_g4> port 443 user { >root } no state\n' \
     "$PHYS" "$UT_IF" "$UT_PEER"
+  printf 'pass in quick on %s inet proto tcp from <zm_g4> port 443 to any no state\n' "$PHYS"
   printf 'block return out quick on %s inet proto udp from any to <zm_g4> port 443 user { >root }\n' "$PHYS"
   printf 'block return out quick on %s inet6 proto { tcp, udp } from any to <zm_g6> port 443 user { >root }\n' "$PHYS"
 }
@@ -754,8 +761,12 @@ pf_rules_main() {
     printf '%s\n' 'block return out quick inet proto udp from any to <zm_quic4> port 443 user { >root }'
     printf '%s\n' 'block return out quick inet6 proto udp from any to <zm_quic6> port 443 user { >root }'
   fi
-  printf 'pass out route-to (lo0 127.0.0.1) inet proto tcp from !127.0.0.0/8 to !<zm_skip4> port %s user { >root }\n' "$ports"
-  printf 'pass out route-to (lo0 fe80::1) inet6 proto tcp from !::1 to !<zm_skip6> port %s user { >root }\n' "$ports"
+  # quick обязателен: без него побеждает последнее подходящее правило, а общий доступ к
+  # интернету (и виртуальные машины с общей сетью) добавляет после нас «pass on en0 all
+  # keep state» — и программы шли бы мимо tpws напрямую. Пересылаемый трафик (той же
+  # виртуальной машины) правило не задевает: у него нет владельца, и user > 0 не совпадает
+  printf 'pass out quick route-to (lo0 127.0.0.1) inet proto tcp from !127.0.0.0/8 to !<zm_skip4> port %s user { >root }\n' "$ports"
+  printf 'pass out quick route-to (lo0 fe80::1) inet6 proto tcp from !::1 to !<zm_skip6> port %s user { >root }\n' "$ports"
 }
 
 pf_load() {   # $1 = якорь, правила — на stdin
@@ -784,11 +795,15 @@ fw_ut_loaded() { pfctl -a "$(anchor_main)" -s rules 2>/dev/null | grep -qF "rout
 # Discord уходил бы в utun50, где его никто не ждёт
 ut_rules_ok() { if ut_active; then fw_ut_loaded; else ! fw_ut_loaded; fi; }
 
-# правда ли трафик программ доходит до tpws: открываем сайт от имени пользователя
-# и ищем в таблице состояний pf соединение, завёрнутое на 127.0.0.1:988
+# правда ли трафик программ доходит до tpws: открываем сайт от имени пользователя со своего
+# локального порта и ищем в таблице состояний pf именно это соединение, завёрнутое на
+# 127.0.0.1:988. Просто «есть такие состояния» не годится: долгие соединения остаются
+# в таблице с тех пор, когда перехват работал, и проверка проходила бы и без него
 redirect_works() {
-  sudo -u "$(probe_user)" /usr/bin/curl -s -o /dev/null --noproxy '*' --connect-timeout 5 --max-time 8 -A "$UA" "$CONTROL_URL" || return 1
-  pfctl -s state 2>/dev/null | grep -qF "127.0.0.1:$TP_PORT"
+  local port=$(( 40000 + RANDOM % 20000 ))
+  sudo -u "$(probe_user)" /usr/bin/curl -s -o /dev/null --noproxy '*' --connect-timeout 5 --max-time 8 \
+    --local-port "$port" -A "$UA" "$CONTROL_URL" || return 1
+  pfctl -s state 2>/dev/null | grep -F "127.0.0.1:$TP_PORT" | grep -qF ":$port "
 }
 
 pf_conf_patch() {
@@ -890,11 +905,13 @@ ut_try_rules() {
   printf 'pass out quick on %s all no state\n' "$UT_TEST_IF"
   printf 'pass out quick on %s route-to (%s %s) inet proto tcp from any to <zm_t4> port { %s } user root no state\n' \
     "$PHYS" "$UT_TEST_IF" "$UT_TEST_PEER" "$DS_TCP"
+  printf 'pass in quick on %s inet proto tcp from <zm_t4> port { %s } to any no state\n' "$PHYS" "$DS_TCP"
   printf 'block return out quick on %s inet proto udp from any to <zm_t4> port 443 user root\n' "$PHYS"
   [ "$1" = 1 ] || return 0
   printf 'table <zm_tg4> const { %s }\n' "$GOOGLE4"
   printf 'pass out quick on %s route-to (%s %s) inet proto tcp from any to <zm_tg4> port 443 user root no state\n' \
     "$PHYS" "$UT_TEST_IF" "$UT_TEST_PEER"
+  printf 'pass in quick on %s inet proto tcp from <zm_tg4> port 443 to any no state\n' "$PHYS"
   printf 'block return out quick on %s inet proto udp from any to <zm_tg4> port 443 user root\n' "$PHYS"
 }
 
@@ -2151,6 +2168,9 @@ cmd_uninstall() {   # $1 = yes — не спрашивать (из прилож�
 cmd_on() {
   ensure_installed
   rm -f "$PAUSE_F"
+  # каждое включение снова пробует прозрачный режим: если он не заработает, cmd_start
+  # сам перейдёт на SOCKS-прокси, а из SOCKS иначе не было бы пути назад
+  [ "$(cfg MODE transparent)" = socks ] && { cfg_set MODE transparent; cfg_set TP_OK 0; }
   [ "$(cfg MODE transparent)" = transparent ] && ut_ensure
   net_load && say "Сеть «${NET_LABEL}» знакома — начинаю с её стратегий."
   SEL_WHO=gui
@@ -2280,13 +2300,27 @@ cmd_debug() {   # on|off — подробный журнал tpws и utunws (д�
   ok "Подробный журнал tpws и utunws: $([ "$1" = on ] && echo включён || echo выключен)"
 }
 
+# Провайдер подделывает ответы публичных DNS: с августа 2026 года ТСПУ перехватывает
+# UDP-запросы к 8.8.8.8 и 1.1.1.1 и на youtube.com отвечает «такого домена нет».
+# С такими DNS YouTube не откроется ни с каким обходом
+dns_spoofed() {
+  local st
+  st=$(/usr/bin/dig +time=2 +tries=1 www.youtube.com A @8.8.8.8 2>/dev/null | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -1)
+  [ "$st" = NXDOMAIN ]
+}
+
 cmd_dns_set() {   # on|off
   case ${1:-} in
-    on)  [ -f "$DNS_BACKUP" ] && { ok "DNS уже Google/Cloudflare."; return 0; } ;;
+    on)  [ -f "$DNS_BACKUP" ] && { ok "DNS уже Google/Cloudflare."; return 0; }
+         if dns_spoofed; then
+           err "Провайдер подменяет ответы 8.8.8.8 и 1.1.1.1 (YouTube «не существует») — DNS оставил как был."
+           return 1
+         fi ;;
     off) [ -f "$DNS_BACKUP" ] || { ok "DNS и так как был."; return 0; } ;;
     *)   die "dns on|off" ;;
   esac
   cmd_dns
+  rm -f "$RUN/dns-spoof"
   log "DNS: $([ "$1" = on ] && echo Google/Cloudflare || echo как был)"
 }
 
@@ -2423,6 +2457,7 @@ cmd_info() {
   printf 'yt=%s\nds=%s\nus=%s\n' "$(yt_desc)" "$(ds_desc)" "$(us_desc)"
   printf 'user_sites=%s\n' "$(cfg USER_SITES 1)"
   printf 'dns=%s\n' "$([ -f "$DNS_BACKUP" ] && echo 1 || echo 0)"
+  [ -f "$DNS_BACKUP" ] && [ -f "$RUN/dns-spoof" ] && printf 'dns_spoof=1\n' 
   printf 'strat_ver=%s\nstrat_updated=%s\n' "$STRAT_VER" "$(cat "$RUN/strat-updated" 2>/dev/null)"
   printf 'tpws_ver=%s\nutunws_ver=%s\nutunws_up=%s\n' "$(cat "$DIR/zapret-version" 2>/dev/null)" \
     "$(cat "$DIR/utunws-version" 2>/dev/null)" "$(ut_up && echo 1 || echo 0)"
@@ -2449,6 +2484,8 @@ cmd_diag() {
   say "наш якорь $(anchor_main):"
   { pfctl -a "$(anchor_main)" -sn; pfctl -a "$(anchor_main)" -sr; } 2>/dev/null | grep -v '^$' | sed 's/^/   /'
   say "состояний к tpws (127.0.0.1:$TP_PORT): $(pfctl -ss 2>/dev/null | grep -cF "127.0.0.1:$TP_PORT"), всего: $(pfctl -ss 2>/dev/null | grep -c .)"
+  say "перехват программ в tpws (своё соединение по своему порту): $(redirect_works && echo работает || echo НЕ РАБОТАЕТ)"
+  say "DNS: $(networksetup -getdnsservers Wi-Fi 2>/dev/null | tr '\n' ' ')· 8.8.8.8 на www.youtube.com: $(dns_spoofed && echo 'подделка (NXDOMAIN)' || echo нормально)"
   say ""; say "── процессы"
   say "tpws: $(pgrep -f "$BIN_DIR/tpws" | tr '\n' ' ')· порт $TP_PORT: $(port_bound "$TP_PORT" && echo слушает || echo нет)"
   say "utunws: $(pgrep -f "$UTUNWS" | tr '\n' ' ')· $UT_IF: $(ut_up && echo поднят || echo нет)"
@@ -2768,6 +2805,28 @@ health_tick() {
        --connect-timeout 5 --max-time 8 "$CONTROL_URL"; then
     NEXT_CHECK=$(( SECONDS + 30 ))
     return 0
+  fi
+  if [ -f "$DNS_BACKUP" ] && dns_spoofed; then
+    if [ ! -f "$RUN/dns-spoof" ]; then
+      : > "$RUN/dns-spoof"
+      log "Провайдер подменяет DNS Google/Cloudflare — YouTube не откроется, пока их не выключить («Дополнительно»)"
+      notify "Провайдер подменяет DNS Google — выключи его в «Дополнительно»"
+    fi
+  else
+    rm -f "$RUN/dns-spoof"
+  fi
+  # перехват программ в tpws: правила загружены — ещё не значит, что работают (их может
+  # перекрыть чужое правило). Не работает и после перезагрузки — SOCKS-прокси, как при установке
+  if [ "$(cfg MODE transparent)" = transparent ] && ! redirect_works; then
+    log "Программы идут мимо tpws — перезагружаю правила pf"
+    fw_off; fw_on >/dev/null 2>&1
+    if ! redirect_works; then
+      log "Перехват в tpws не работает и после перезагрузки правил — переключаюсь на SOCKS-прокси"
+      tp_fallback
+      notify "Прозрачный режим перестал работать — включил SOCKS-прокси"
+      return 0
+    fi
+    log "Перехват в tpws снова работает"
   fi
   if [ "$(cfg MODE transparent)" = socks ]; then run_checks "socks:$SOCKS_PORT"; else run_checks apps; fi
   check_save bypass

@@ -183,6 +183,18 @@ struct MainView: View {
                 Engines()
             }
             PauseControl().padding(.top, 14)
+            if m.dnsSpoofed {
+                Button { m.page = .extras } label: {
+                    Label("Провайдер подменяет DNS Google — выключи его", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(Palette.stop)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Capsule().fill(Palette.stop.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 12)
+                .help("Открыть «Дополнительно»")
+            }
             Spacer(minLength: 10)
             BottomBar()
         }
