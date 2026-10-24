@@ -787,7 +787,19 @@ pf_take() {   # $1 = файл для токена
 }
 pf_give() { [ -s "$1" ] && pfctl -X "$(cat "$1")" >/dev/null 2>&1; rm -f "$1"; }
 
-fw_on() { pf_rules_main | pf_load "$(anchor_main)" && pf_take "$RUN/pf-token"; }
+# AmneziaVPN, подключаясь, грузит в pf «set skip on lo0» (amn.000.allowLoopback.conf):
+# pf перестаёт обрабатывать lo0 совсем, а с ним и наш rdr — перехват мёртв, хотя правила на
+# месте. После отключения VPN флаг остаётся. Снимаем его загрузкой параметров pf без -m:
+# неуказанные параметры (skip в том числе) возвращаются к значениям по умолчанию, правила
+# (-O) не трогаются
+lo0_skipped() { pfctl -s Interfaces -v 2>/dev/null | grep -qE '^lo0[[:space:]].*skip'; }
+lo0_unskip() {
+  lo0_skipped || return 0
+  printf '' | pfctl -q -O -f - >/dev/null 2>&1
+  if lo0_skipped; then log "lo0 помечен в pf как skip (так делает AmneziaVPN), снять не удалось — перехват в tpws не заработает"; return 1; fi
+  log "Снял с lo0 флаг skip, оставленный VPN-клиентом (AmneziaVPN) — без этого перехват в tpws не работает"
+}
+fw_on() { lo0_unskip; pf_rules_main | pf_load "$(anchor_main)" && pf_take "$RUN/pf-token"; }
 fw_off() { pfctl -q -a "$(anchor_main)" -F all >/dev/null 2>&1; }
 fw_loaded() { pfctl -a "$(anchor_main)" -s nat 2>/dev/null | grep -q '^rdr'; }
 fw_ut_loaded() { pfctl -a "$(anchor_main)" -s rules 2>/dev/null | grep -qF "route-to ($UT_IF "; }
@@ -2493,6 +2505,7 @@ cmd_diag() {
   say ""; say "── pf"
   pfctl -si 2>/dev/null | grep -E 'Status|current entries|searches|inserts|removals|memory|state-limit|src-limit'
   pfctl -sm 2>/dev/null | grep -E 'states|src-nodes|frags|table-entries'
+  say "lo0: $(lo0_skipped && echo 'помечен как skip — pf его не обрабатывает, перехват в tpws мёртв' || echo 'обрабатывается')"
   say "якоря в основном наборе:"
   { pfctl -sn; pfctl -sr; } 2>/dev/null | grep -E 'anchor' | sed 's/^/   /'
   say "наш якорь $(anchor_main):"
@@ -2565,6 +2578,12 @@ cmd_redirect_test() {
     say "tpws: временный, прозрачный, порт $TP_PORT (журнал: $log)"
   fi
   pf_take "$RUN/pf-token-rt"
+  if lo0_skipped; then
+    say "lo0 помечен в pf как skip (rdr на нём не работает) — снимаю"
+    lo0_unskip && say "   снят" || say "   снять не удалось"
+  else
+    say "lo0 в pf не пропускается — rdr на нём работает"
+  fi
   for root in zapret-mac com.apple; do
     if [ "$root" = zapret-mac ] && ! pfctl -sn 2>/dev/null | grep -qF 'rdr-anchor "zapret-mac/*"'; then
       say ""; say "── якорь zapret-mac/zapret-mac: точки подключения нет в загруженном наборе pf — пропускаю"; continue
@@ -2745,7 +2764,7 @@ reconcile() {   # $1 = full — проверить pf и tpws; без него �
     fi
     WD_NET=$net
     if [ "$mode" = transparent ]; then
-      if ! fw_loaded || ! pf_on || ! ut_rules_ok; then
+      if ! fw_loaded || ! pf_on || ! ut_rules_ok || lo0_skipped; then
         if fw_on >/dev/null 2>&1; then
           if ut_active; then log "Перенаправление pf включено, Discord — через utunws"
           elif ut_wanted; then log "Перенаправление pf включено, utunws не отвечает — Discord пока через tpws"
