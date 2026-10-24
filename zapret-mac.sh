@@ -2565,7 +2565,7 @@ cmd_gui_install() {
 # Плюс раз в CHECK_EVERY секунд проверяет YouTube и Discord и при сбое сам подбирает
 # стратегии в фоне, а раз в сутки скачивает свежие стратегии и списки.
 WD_STATE=""; WD_VPN=""; WD_EXTRA=""; WD_APP=""; WD_NET=""; FAILS=0; NEXT_CHECK=0; BACKOFF=$CHECK_EVERY
-SEL_PID=""; UPD_PID=""; LAST_FULL=0; LAST_TICK=0; FAIL_NOTIFIED=0; NEXT_UPDATE=0; STRAT_MTIME=""
+SEL_PID=""; UPD_PID=""; LAST_FULL=0; LAST_TICK=0; FAIL_NOTIFIED=0; NEXT_UPDATE=0; STRAT_MTIME=""; REDIRECT_NOTIFIED=0
 
 wd_status() { printf '%s %s\n' "$1" "$2" > "$RUN/status.new" && chmod 644 "$RUN/status.new" && mv -f "$RUN/status.new" "$RUN/status"; }
 
@@ -2816,17 +2816,21 @@ health_tick() {
     rm -f "$RUN/dns-spoof"
   fi
   # перехват программ в tpws: правила загружены — ещё не значит, что работают (их может
-  # перекрыть чужое правило). Не работает и после перезагрузки — SOCKS-прокси, как при установке
+  # перекрыть чужое правило). Не помогла и перезагрузка правил — только сообщаем: SOCKS-прокси
+  # выключил бы utunws, а с ним рабочие YouTube и Discord. «Включить» проверит заново и при
+  # настоящей поломке сам перейдёт на SOCKS
   if [ "$(cfg MODE transparent)" = transparent ] && ! redirect_works; then
     log "Программы идут мимо tpws — перезагружаю правила pf"
     fw_off; fw_on >/dev/null 2>&1
-    if ! redirect_works; then
-      log "Перехват в tpws не работает и после перезагрузки правил — переключаюсь на SOCKS-прокси"
-      tp_fallback
-      notify "Прозрачный режим перестал работать — включил SOCKS-прокси"
-      return 0
+    if redirect_works; then
+      log "Перехват в tpws снова работает"
+    elif [ "$REDIRECT_NOTIFIED" != 1 ]; then
+      REDIRECT_NOTIFIED=1
+      log "Перехват в tpws не работает и после перезагрузки правил — свои сайты идут напрямую (подробности: diag)"
+      notify "Свои сайты идут мимо обхода — нажми «Выключить» и «Включить»"
     fi
-    log "Перехват в tpws снова работает"
+  else
+    REDIRECT_NOTIFIED=0
   fi
   if [ "$(cfg MODE transparent)" = socks ]; then run_checks "socks:$SOCKS_PORT"; else run_checks apps; fi
   check_save bypass

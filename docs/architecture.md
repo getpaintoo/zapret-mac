@@ -78,8 +78,10 @@ utunws работает только в прозрачном режиме. Бе�
 ```
 rdr pass on lo0 inet proto tcp from !127.0.0.0/8 to !<zm_skip4> port { 80, 443 } -> 127.0.0.1 port 988
 block return out quick inet proto udp from any to <zm_quic4> port 443 user { >root }
-pass out route-to (lo0 127.0.0.1) inet proto tcp from !127.0.0.0/8 to !<zm_skip4> port { 80, 443 } user { >root }
+pass out quick route-to (lo0 127.0.0.1) inet proto tcp from !127.0.0.0/8 to !<zm_skip4> port { 80, 443 } user { >root }
 ```
+
+`quick` обязателен. В pf без него побеждает последнее подходящее правило, а общий доступ к интернету macOS (его включают и виртуальные машины с общей сетью — UTM, Docker) кладёт после наших якорей `com.apple.internet-sharing/base_v4` с правилом `pass on en0 all flags any keep state`. Без `quick` оно перекрывало перехват, и программы шли мимо tpws напрямую — до 3.0 так и было, когда работала такая виртуальная машина. Пересылаемый трафик самой машины перехват не задевает: у него нет владельца-сокета, а `user > 0` с «неизвестным» владельцем не совпадает.
 
 Такие же правила есть для IPv6 (через `fe80::1` на lo0).
 
@@ -89,6 +91,8 @@ pass out route-to (lo0 127.0.0.1) inet proto tcp from !127.0.0.0/8 to !<zm_skip4
 pass out quick on utun50 all no state
 pass out quick on en0 route-to (utun50 10.77.0.2) inet proto tcp from any to <zm_ds4> port { 443, 2053, 2083, 2087, 2096, 8443 } user { >root } no state
 pass out quick on en0 route-to (utun50 10.77.0.2) inet proto udp from any to !<zm_skip4> port { 19294:19344, 50000:50100 } user { >root } no state
+pass in quick on en0 inet proto tcp from <zm_ds4> port { 443, 2053, 2083, 2087, 2096, 8443 } to any no state
+pass in quick on en0 inet proto udp from any port { 19294:19344, 50000:50100 } to any no state
 block return out quick on en0 inet proto udp from any to <zm_ds4> port 443 user { >root }
 block return out quick on en0 inet6 proto { tcp, udp } from any to <zm_ds6> user { >root }
 ```
@@ -104,6 +108,7 @@ block return out quick on en0 inet6 proto { tcp, udp } from any to <zm_g6> port 
 - `<zm_ds4>` — адреса Discord: на Cloudflare `162.159.128.0/21` и `162.159.136.0/22` (`discord.com`, `gateway.discord.gg`, `cdn.discordapp.com`, `media.discordapp.net`, `discord.media`) и сервер обновлений `stable.dl2.discordapp.net` в Google Cloud.
 - `<zm_g4>`, `<zm_g6>` — сервисы Google без Google Cloud, та же таблица, что для QUIC.
 - Первое правило нужно потому, что пакет, отправленный через `route-to` в другой интерфейс, pf проверяет ещё раз уже на нём, и без него пакет перехватило бы правило tpws, у которого нет привязки к интерфейсу.
+- Правила `pass in … no state` для ответов нужны из-за того же правила общего доступа: по ответу сервера на SYN, ушедший в utunws без состояния, оно создавало состояние, и дальше пакеты соединения шли по нему напрямую, мимо utunws. utunws видел только SYN, и любая стратегия давала Discord 0 из 5. Такие же правила есть в якоре подбора `zapret-mac-test`.
 - QUIC к Discord и Discord по IPv6 сразу получают отказ, и приложение уходит на TCP по IPv4 — то есть в utunws.
 - Пакеты, которые utunws пишет через BPF, через pf не проходят.
 
@@ -113,7 +118,7 @@ block return out quick on en0 inet6 proto { tcp, udp } from any to <zm_g6> port 
 - `<zm_skip4>` — локальные сети: 10/8, 172.16/12, 192.168/16, 100.64/10 и служебные диапазоны.
 - `<zm_quic4>` — сервисы Google без Google Cloud. `block return` сразу отвечает браузеру отказом, и он без задержки переходит с HTTP/3 на TCP.
 
-Сначала правила грузятся в дочерний якорь `com.apple/zapret-mac`, и `/etc/pf.conf` не меняется. Скрипт проверяет, что перенаправление правда работает: открывает сайт от имени пользователя и ищет в таблице состояний pf соединение на `127.0.0.1:988`. Если его нет, скрипт, как установщик zapret, вписывает в `/etc/pf.conf` строки `rdr-anchor "zapret-mac/*"` и `anchor "zapret-mac/*"` (копия оригинала сохраняется в `/opt/zapret-mac/pf.conf.orig`) и использует якорь `zapret-mac/zapret-mac`. Если не помогает и это, включается режим SOCKS-прокси.
+Сначала правила грузятся в дочерний якорь `com.apple/zapret-mac`, и `/etc/pf.conf` не меняется. Скрипт проверяет, что перенаправление правда работает (`redirect_works`): открывает сайт от имени пользователя со случайного локального порта и ищет в таблице состояний pf именно это соединение на `127.0.0.1:988`. Искать просто «какое-нибудь соединение на 127.0.0.1:988» нельзя: долгие соединения остаются в таблице с тех пор, когда перехват работал, и проверка проходила бы и без него. Сторож повторяет эту проверку перед каждой проверкой сайтов и, если перехват не работает, перезагружает правила. Если его нет, скрипт, как установщик zapret, вписывает в `/etc/pf.conf` строки `rdr-anchor "zapret-mac/*"` и `anchor "zapret-mac/*"` (копия оригинала сохраняется в `/opt/zapret-mac/pf.conf.orig`) и использует якорь `zapret-mac/zapret-mac`. Если не помогает и это, включается режим SOCKS-прокси.
 
 pf включается через `pfctl -E` с токеном, а не `pfctl -e`, чтобы не выключить его для других программ.
 
